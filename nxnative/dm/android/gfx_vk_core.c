@@ -81,6 +81,13 @@ static void mem_diag_baselines(const uint64_t count[4], const uint64_t bytes[4])
         names[i], (unsigned long long)count[i], bytes[i] / 1048576.0, (unsigned long long)total_count[i], total_bytes[i] / 1048576.0, (unsigned long long)calls);
 }
 
+// mmap at a fixed address that may carry a pointer tag: Android's heap hands out tagged pointers (0xb4 in bits 56-63, top-byte ignore), and the kernel refuses a tagged
+// MAP_FIXED address. Batman: Arkham Knight's memory pools come from Unreal's allocator on that heap: none of them could be zero-copy (-1), every one a GPU copy synced at
+// each submission. Maps at the untagged address; returns at (tag kept) on success, so the callers' "== at" checks hold
+static void *mapfix(void *at, size_t n, int prot, int flags, int fd, off_t off) {
+    uintptr_t a = (uintptr_t)at, u = a & 0x00ffffffffffffffull;
+    return mmap((void *)u, n, prot, flags, fd, off) == (void *)u ? at : MAP_FAILED;
+}
 uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {
     for (uint32_t i = 0; i < V.mem.memoryTypeCount; i++)
         if ((bits >> i & 1) && (V.mem.memoryTypes[i].propertyFlags & want) == want && !(V.mem.memoryTypes[i].propertyFlags & avoid)) return i;
@@ -507,7 +514,7 @@ static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size) {
     if (slab_take(size, &sl, &si)) {
         uint64_t off = (uint64_t)si * sl->slot_bytes;
         memcpy(sl->map + off, mem, size);
-        if (mmap(mem, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, sl->fd, (off_t)off) == mem) {
+        if (mapfix(mem, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, sl->fd, (off_t)off) == mem) {
             p->buf = sl->buf; p->mem = VK_NULL_HANDLE; p->ahb = NULL; p->boff = off; p->slab = sl; p->slot = si; p->zero_copy = 1; return 0; }
         mem_diag_zc(11, "mmap-fixed slab", size, "errno", errno); slab_give(sl, si, 0);   // (the anonymous pages are still there: a buffer of its own)
     }
@@ -531,7 +538,7 @@ static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size) {
     int ok = tmp != MAP_FAILED;
     if (ok) {
         memcpy(tmp, mem, size); munmap(tmp, size);
-        ok = mmap(mem, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fds[0], 0) == mem;
+        ok = mapfix(mem, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fds[0], 0) == mem;
         if (!ok) mem_diag_zc(6, "mmap-fixed", size, "errno", errno);
     } else mem_diag_zc(5, "mmap-temporary", size, "errno", errno);
     for (int i = 0; i < nfd; i++) close(fds[i]);
@@ -597,7 +604,7 @@ int vk_pool_remap_ro(void *mem, size_t len) {
                 uint64_t ql = q->lo > a ? q->lo : a, qh = q->hi < p->hi ? q->hi : p->hi;
                 if (ql < lo) { lo = ql; hi = qh; } else if (ql == lo && qh > hi) hi = qh;
             }
-            if (lo > a) { void *at = (void *)(uintptr_t)a; rc = mmap(at, lo - a, PROT_READ, MAP_SHARED | MAP_FIXED, fd, (off_t)(a - p->lo + p->boff)) == at ? 0 : -1; }
+            if (lo > a) { void *at = (void *)(uintptr_t)a; rc = mapfix(at, lo - a, PROT_READ, MAP_SHARED | MAP_FIXED, fd, (off_t)(a - p->lo + p->boff)) == at ? 0 : -1; }
             a = hi;
         }
         if (own) close(fd);
@@ -624,13 +631,13 @@ static void pool_copy_back(vkpool_t *p) {
         uint64_t n = e - a; int ok = 0;
         if (fd >= 0) {
             uint8_t *tmp = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, off);
-            if (tmp != MAP_FAILED) { memcpy(tmp, mem, n); munmap(tmp, n); ok = mmap(mem, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off) == mem; }
+            if (tmp != MAP_FAILED) { memcpy(tmp, mem, n); munmap(tmp, n); ok = mapfix(mem, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off) == mem; }
             if (own) close(fd);
             if (!ok) { static int said; if (!said++) VKLOG("[RED] memory pool %p +%#llx inside another pool: its pages could not go back to that pool's buffer (errno %d): anonymous memory, which the outer pool's next remap replaces", (void *)mem, (unsigned long long)n, errno); }
         }
         if (!ok) {
             uint8_t *save = malloc(n); if (save) memcpy(save, mem, n);
-            mmap(mem, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            mapfix(mem, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
             if (save) { memcpy(mem, save, n); free(save); }
         }
         a = e;

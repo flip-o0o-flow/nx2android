@@ -21,7 +21,10 @@ VK_FNS(DEFINE) VK_DEV_FNS(DEFINE)
 static vkpool_t g_pool[MAXPOOL]; static int g_npool, g_pool_ord[MAXPOOL]; static uint32_t g_pool_gen;
 static pthread_rwlock_t g_pool_mu = PTHREAD_RWLOCK_INITIALIZER;
 static uint64_t g_set_epoch = 1, g_tex_gen, g_samp_gen, g_num_um, g_num_im, g_ubolog_key, g_tex_sseq;
-static int g_x_nosetmemo, g_tracing, g_var_now, g_x_nosetc, g_x_nodrvc, g_x_setverify, g_x_nodispbar;
+static int g_x_nosetmemo, g_tracing, g_var_now, g_x_nosetc, g_x_nodrvc, g_x_setverify, g_x_nodispbar, g_trace_frame, g_tf_dl, g_tf_draws, g_is_collect, g_x_nomemofix;   // the frame trace and image statistics (off)
+#define TFLOG(...) ((void)0)
+static void tf_words(const char *what, const uint32_t *w, uint32_t nw) { (void)what; (void)w; (void)nw; }
+static void istat_flush(void) {}
 static int g_x_tracepass = -1, g_sub_pass, g_prof_on, g_prereset = 1;
 static uint64_t g_prof_ns[8], g_fence;
 static long long g_td_off = -1;

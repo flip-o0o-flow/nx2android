@@ -338,6 +338,11 @@ static void sparse_layout(const nvn_texdesc *d, NVNtextureSparseTileLayout *o) {
 NVN(nvnTextureBuilderGetSparseTileLayout, void, const NVNtextureBuilder *b, NVNtextureSparseTileLayout *o) { sparse_layout(&((const tex_builder_t *)b)->d, o); }
 #define TX(t) ((tex_t *)(t))
 #define CTX(t) ((const tex_t *)(t))
+// The profile's tex_flush_upload / tex_dirty_upload, with DM_VK_X_NOREUP=1 (start-up) turning both off for an A/B run (Batman: Arkham Knight, whose UE3 fills its uncompressed
+// textures, its colour grading LUT among them, in place, as suspected from run 6: as Vulkan images of zeros the graded picture would be black; the Mac draws it without the keys)
+static int tex_upload_env(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_X_NOREUP"); v = !(e && atoi(e)); } return v; }
+#define TEX_FLUSH_UPLOAD (DM_GAME_TEX_FLUSH_UPLOAD && tex_upload_env())
+#define TEX_DIRTY_UPLOAD (DM_GAME_TEX_DIRTY_UPLOAD && tex_upload_env())
 // Textures the CPU fills in place (profile tex_flush_upload): Tears of the Kingdom streams its textures (TexToGo, already in the GPU's block-linear layout) straight into
 // CPU-cached memory pools and publishes each with nvnMemoryPoolFlushMappedRange (9,436 calls at boot), without a packaged layout or WriteTexels. They stayed GPU-only
 // textures with content 0, and the G-buffer's base colour came out black. Textures that can hold such data (not render targets, not linear, no packaged layout, in a pool
@@ -350,11 +355,11 @@ static void ft_log(const tex_t *t, const char *why) {   // the large ones (16 MB
 static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_mu = PTHREAD_MUTEX_INITIALIZER;
 static void ft_add(const tex_t *t) {
     // Buffer textures are views onto the pool buffer the GPU reads directly (tex_mtl in nvn_mtl.m); an upload would push Age of Calamity's 1,048,576-texel R32F one through tex_desc, past Metal's 2D limit
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+    if (!TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
         (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE))) return;
     pthread_mutex_lock(&g_ft_mu);
     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
-    uint64_t st = nvn_dirty_now(); if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
+    uint64_t st = nvn_dirty_now(); if (TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
     g_ft[g_nft++] = (flush_tex){t->mem, t->L.size, *t, st, nvn_dirty_span(t->mem, t->L.size)};
     pthread_mutex_unlock(&g_ft_mu);
 }
@@ -367,7 +372,7 @@ static void ft_del_now(uint64_t serial) {   // g_ft_mu held
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; break; }
 }
 static void ft_del(uint64_t serial) {
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return;
+    if (!TEX_FLUSH_UPLOAD || !serial) return;
     uint64_t seq = nvn_jobs_queued();
     pthread_mutex_lock(&g_ft_mu);
     if (!seq) ft_del_now(serial);
@@ -382,7 +387,7 @@ static void ft_del_drain(void) {   // the replay thread, at each submission
     pthread_mutex_unlock(&g_ft_mu);
 }
 static void ft_drop(const uint8_t *a, uint64_t n) {   // a pool goes: the textures over it that were never Finalized leave the list (their entries pointed at dead memory and stayed for good)
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !a || !n) return;
+    if (!TEX_FLUSH_UPLOAD || !a || !n) return;
     pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft;) if (g_ft[i].mem >= a && g_ft[i].mem < a + n) g_ft[i] = g_ft[--g_nft]; else i++;
     pthread_mutex_unlock(&g_ft_mu);
@@ -391,7 +396,7 @@ static void ft_drop(const uint8_t *a, uint64_t n) {   // a pool goes: the textur
 // natively; its 121-layer ASTC terrain material arrays, 42 MB each). They stayed GPU-only textures with content 0, which ASTC decodes as the error colour, and the cave came out magenta.
 // ft_add write-protects a registered texture's pages, and on its first resolution (tex_mtl, submit thread) a write since then makes it CPU-written like a flushed one
 int nvn_ft_written(const tex_t *t) {
-    if (!DM_GAME_TEX_DIRTY_UPLOAD || !t->serial) return 0;
+    if (!TEX_DIRTY_UPLOAD || !t->serial) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) {
         if (nvn_dirty_since_span(g_ft[i].span, g_ft[i].mem, g_ft[i].size, g_ft[i].stamp)) { r = 1; g_ft[i] = g_ft[--g_nft]; }
@@ -409,7 +414,7 @@ int nvn_ft_written(const tex_t *t) {
 // Checking every texture at every submission cost TOTK 0.4 ms of submit CPU per frame on the Mac; this way a texture is picked up a few submissions later at most
 enum { FT_POLL_BYTES = 128 << 20 };
 void nvn_ft_poll(void) {
-    if (!DM_GAME_TEX_DIRTY_UPLOAD) return;
+    if (!TEX_DIRTY_UPLOAD) return;
     static uint64_t gen; static size_t cur, left;
     static tex_t *hit; static size_t chit; size_t nhit = 0;
     uint64_t now = nvn_dirty_now(), scanned = 0;
@@ -427,7 +432,7 @@ void nvn_ft_poll(void) {
     for (size_t i = 0; i < nhit; i++) if (!mtl_tex_gpu_owned(hit[i].serial)) { ft_log(&hit[i], "pages written (poll)"); mtl_tex_cpu_written(&hit[i]); }   // outside g_ft_mu: the ownership check takes the replay's serial table lock
 }
 static void ft_flush(const uint8_t *a, uint64_t n) {
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !a || !n) return;
+    if (!TEX_FLUSH_UPLOAD || !a || !n) return;
     pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft;)
         if (g_ft[i].mem < a + n && a < g_ft[i].mem + g_ft[i].size) { ft_log(&g_ft[i].t, "flushed"); mtl_tex_cpu_written(&g_ft[i].t); g_ft[i] = g_ft[--g_nft]; } else i++;
@@ -662,7 +667,12 @@ static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     uint32_t nctl = 0x880, own; memcpy(&own, (const uint8_t *)sd->control + 0x20, 4);
     if (own >= 0x760 && own < 0x880) nctl = own;
     uint8_t md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_CTX hc; CC_SHA256_Init(&hc);
-    CC_SHA256_Update(&hc, sd->control, nctl);
+    // Profile key shader_key_skip: bytes of the control section hashed as zeros (shader_split.py key_ctl). Batman: Arkham Knight's engine shares one control section among shaders whose
+    // sections differ only in GLSLC's compile information (+0x778..+0x791, +0x7d0..+0x7e7): it hands a program the section of an earlier shader with the same rest, so the bytes there name another shader
+    if (DM_GAME_SHADER_KEY_SKIP_LEN && DM_GAME_SHADER_KEY_SKIP_OFF + DM_GAME_SHADER_KEY_SKIP_LEN <= nctl) {
+        uint8_t ctl[0x880]; memcpy(ctl, sd->control, nctl); memset(ctl + DM_GAME_SHADER_KEY_SKIP_OFF, 0, DM_GAME_SHADER_KEY_SKIP_LEN);
+        CC_SHA256_Update(&hc, ctl, nctl);
+    } else CC_SHA256_Update(&hc, sd->control, nctl);
     if (code) CC_SHA256_Update(&hc, (const void *)(uintptr_t)sd->data, ncode);
     CC_SHA256_Final(md, &hc); memcpy(out, md, 8);
     return 1;

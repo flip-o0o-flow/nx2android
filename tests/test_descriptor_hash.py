@@ -26,7 +26,7 @@ class DescriptorHash(unittest.TestCase):
 #include <stdlib.h>
 #include <string.h>
 static uint64_t g_set_epoch = 1, g_set_hits, g_set_new, g_ns_set_hash, g_ns_set_new;
-static int g_tracing, g_x_nosetc, updates;
+static int g_tracing, g_x_nosetc, updates, g_trace_frame;
 static struct { VkDevice dev; } V;
 static uint64_t tick(void) { return 0; }
 static VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {

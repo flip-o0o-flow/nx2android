@@ -447,7 +447,7 @@ class Port:
         if self.gl: say(f"{self.app_name} renders with OpenGL ({src['graphics'][1]}): the Android host hands its GL calls to the device's OpenGL ES driver"); return
         if gfx != 'nvn': raise BuildError(f'{self.app_name} renders with {gfx} ({src["graphics"][1]}): the Android host replays NVN or OpenGL ES only so far')
         # Game Freak's GFPAKs and Trinity packs with Oodle entries: decoded by the game's own decoder on the Android device (device_oodle); PKZ packs still need the Mac host
-        self.oodle_why = src['oodle_packs'][1] if src['oodle_packs'][0] and ('GFPAK' in src['oodle_packs'][1] or 'Trinity' in src['oodle_packs'][1]) else ''
+        self.oodle_why = src['oodle_packs'][1] if src['oodle_packs'][0] and any(w in src['oodle_packs'][1] for w in ('GFPAK', 'Trinity', 'Unreal Engine 3')) else ''   # UE3: device_oodle_ue3
         # Unreal paks (version 11) and IoStore containers: their shader code archives are decoded with the game's own Oodle on the device too (device_ue)
         self.ue_why = src['ue_decode'][1] if src['ue_decode'][0] else ''
         why = self.oodle_why or self.ue_why
@@ -470,6 +470,7 @@ class Port:
         shader come back (DM_OODLE_JOB_BNSH), written as the split's decoded folder (shader_split.py gfpak_decoded, trpfs_decoded). Streaming the entries through an adb forward
         instead reset the connection whenever both directions were busy.
         → the split's environment"""
+        if 'Unreal Engine 3' in self.oodle_why: return self.device_oodle_ue3()
         import mmap
         import struct
         PROG.set(step="the game's Oodle entries in a job file")
@@ -528,6 +529,53 @@ class Port:
         nsp.rmtree(tmp / 'job.out')
         say(f"shaders in Oodle-compressed archives ({self.oodle_why}): {len(recs):,} entries decoded by the game's own decoder on the device, "
             f"{sum(len(e) for _, e in by.values()):,} of them hold shaders")
+        return {'DM_GFPAK_DECODED': str(dec)}
+    UE3_TAG = bytes.fromhex('c1832a9e')   # an Unreal package's tag (shader_split.py ue3_package)
+    def device_oodle_ue3(self):
+        """Unreal Engine 3 packages whose compressed chunks are Oodle blocks (Batman: Arkham Knight). Only the shader caches hold shaders (upstream sampled 68 other packages: none), so the
+        Oodle blocks of the packages named *ShaderCache* go to the device in one job (Arkham Knight: CombinedShaderCache-Switch.xxx, 1,040 blocks, 29 MB → 136 MB), all of them back
+        (not BNSH entries: the blocks are raw package bytes). Written as DM_GFPAK_DECODED/<label with / as __>.dec = 'DU3D', u64 the package's size, u32 count, then per block u64 its
+        offset in the package, u32 length and the bytes (shader_split.py ue3_decoded); the split skips the other Oodle packages.
+        ponytail: chosen by file name; a UE3 game with shaders in other packages needs them listed here"""
+        import struct
+        PROG.set(step="the shader caches' Oodle blocks in a job file")
+        tmp = self.work / 'tmp/oodle'; nsp.rmtree(tmp); tmp.mkdir(parents=True)
+        recs, job, T = [], tmp / 'job.bin', self.UE3_TAG   # recs: (label, package size, block offset) of each record, in order
+        with open(job, 'wb') as jf:
+            jf.write(b'DMOJ' + struct.pack('<I', 0))
+            for v in self.versions:
+                rom = self.dirs[v] / 'RomFS'
+                for p in sorted(rom.rglob('*ShaderCache*')):
+                    d = p.read_bytes(); label = '/' + p.relative_to(rom).as_posix()
+                    if d[:4] != T: continue   # the global cache ('BMSG') is not compressed
+                    i = d.find(T, 4)   # the chunks after the summary (shader_split.py ue3_body)
+                    while 0 <= i and i + 16 <= len(d) and d[i:i + 4] == T:
+                        bs, _, us = struct.unpack_from('<III', d, i + 4)
+                        if not bs: raise BuildError(f'{label}: chunk at {i:#x} has block size 0')
+                        nb = (us + bs - 1) // bs; o = i + 16 + 8 * nb
+                        for k in range(nb):
+                            c, u = struct.unpack_from('<II', d, i + 16 + 8 * k)
+                            if c != u and d[o:o + 1] != b'\x78': jf.write(struct.pack('<II', c, u) + d[o:o + c]); recs.append((label, len(d), o))   # stored and zlib blocks the split reads itself
+                            o += c
+                        i = o
+            jf.seek(4); jf.write(struct.pack('<I', len(recs)))
+        if not recs: raise BuildError(f'{self.app_name}: no Oodle block in a *ShaderCache* package ({self.oodle_why})')
+        PROG.set(step=f"the game's Oodle decoder on the device: {len(recs):,} blocks, {job.stat().st_size / 2**20:.0f} MB")
+        self.device_oodle_job(job, tmp / 'job.out')
+        r = (tmp / 'job.out').read_bytes()
+        if r[:4] != b'DMOR' or struct.unpack_from('<I', r, 4)[0] != len(recs): raise BuildError("the game's Oodle decoder on the device answered for other blocks than it was given")
+        by, o = {}, 8   # label → (package size, [(offset, bytes)])
+        for label, size, off in recs:
+            n = struct.unpack_from('<I', r, o)[0] if o + 4 <= len(r) else None; o += 4
+            if n in (None, 0, 0xffffffff) or o + n > len(r): raise BuildError(f"the game's Oodle decoder on the device failed or returned a truncated result for {label} block at {off:#x}")
+            by.setdefault(label, (size, []))[1].append((off, r[o:o + n])); o += n
+        dec = tmp / 'decoded'; dec.mkdir()
+        for label, (size, blocks) in by.items():
+            with (dec / (label.lstrip('/').replace('/', '__') + '.dec')).open('wb') as f:
+                f.write(b'DU3D' + struct.pack('<QI', size, len(blocks)))
+                for off, b in blocks: f.write(struct.pack('<QI', off, len(b)) + b)
+        nsp.rmtree(tmp / 'job.out')
+        say(f"shaders in Oodle-compressed Unreal Engine 3 packages: {len(recs):,} blocks of {', '.join(by)} decoded by the game's own decoder on the device")
         return {'DM_GFPAK_DECODED': str(dec)}
     def device_oodle_job(self, job, out, bnsh=False):
         """One Oodle job file (hle_oodle.c: "DMOJ" records) decoded on the device into out ("DMOR"); the job file is removed. The host as an executable and the rewritten modules

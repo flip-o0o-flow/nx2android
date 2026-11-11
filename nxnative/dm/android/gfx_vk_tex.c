@@ -626,7 +626,12 @@ VkImageView vk_tex_view_as(const tex_t *t, const view_t *vw, int dim, int arraye
             }
             if (want == VK_IMAGE_VIEW_TYPE_CUBE) nly = 6;
         } else {
-            if (want == VK_IMAGE_VIEW_TYPE_3D && im->d == 1) want = type;
+            // A 2D texture in a 3D slot binds the zero 3D texture (upstream nxnative 2bccdcc, Metal): Vulkan has no 3D view of a 2D image, and the 2D view this gave a sampler3D
+            // is undefined. Batman: Arkham Knight samples a world-space volume through slots 1-4 and from New Story on leaves its 2D half-resolution targets bound there
+            if (want == VK_IMAGE_VIEW_TYPE_3D && im->vtype != VK_IMAGE_VIEW_TYPE_3D) {
+                VKRED_ONCE(113, "2D texture %ux%u (target %d) in a 3D slot: the zero 3D texture is bound", im->w, im->h, target);
+                return VK_NULL_HANDLE;
+            }
             if ((want == VK_IMAGE_VIEW_TYPE_1D || want == VK_IMAGE_VIEW_TYPE_1D_ARRAY) != (type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_1D_ARRAY)) want = type;
         }
         type = want;
@@ -733,6 +738,9 @@ static VkSampler make_sampler(const samp_par *p) {
     ci.anisotropyEnable = p->aniso > 1.0f; ci.maxAnisotropy = p->aniso > V.max_aniso ? V.max_aniso : p->aniso;
     ci.compareEnable = p->cmp_mode == 1; ci.compareOp = cmp_op(p->cmp_func);
     ci.minLod = p->lod_min; ci.maxLod = p->minf <= 1 ? 0.25f : p->lod_max;   // no mipmap filter: level 0 only (GL's rule)
+    // ... and from level 0: Metal's NotMipmapped (nvn_mtl.m samp_by_id) reads level 0 whatever the LOD clamp; a minimum LOD above 0.25 with maxLod 0.25 is invalid in Vulkan
+    // (minLod > maxLod) and picks another level or nothing. DM_VK_X_NOLOD0=1 (start-up): as before
+    { static int nolod0 = -1; if (nolod0 < 0) { const char *e = getenv("DM_VK_X_NOLOD0"); nolod0 = e && atoi(e); } if (p->minf <= 1 && !nolod0) ci.minLod = 0; }
     int border = ci.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || ci.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || ci.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     if (border) {
