@@ -79,7 +79,12 @@ static inline uint64_t tick(void) {
 // DM_VK_X_NOBAR=1 no barrier before a pass, DM_VK_X_DEPTH=1 depth neither loaded nor stored, DM_VK_X_COLOR=1 colour not loaded unless cleared
 static int g_x_nobar, g_x_depth, g_x_color, g_x_cbdraws, g_x_tracepass = -1, g_sub_pass;   // DM_VK_TRACE_PASS=n: log every draw of the submission's pass n (once)
 static int g_x_listpasses;
-uint64_t vk_replay_ns(void) { return g_vkst.ns_exec; }   // the replay time so far (gfx_vk_present.c: a frame's cost for the adaptive rate)
+uint64_t vk_replay_ns(void) { return g_vkst.ns_exec; }
+// The long-frame line (hle_nvn.c): graphics pipelines built on the replay thread and shader variants made there, with their time. On Android these counted nothing before
+// (stubs), so its "new pipelines 0 + shader libraries 0" said nothing about a frame
+static uint64_t g_pipe_ns;
+void mtl_create_stats(uint64_t *l, uint64_t *p) { extern uint64_t g_var_made; *l = g_var_made; *p = g_vkst.pipes_built; }
+void mtl_create_ns(uint64_t *l, uint64_t *p) { extern uint64_t g_var_ns; *l = g_var_ns; *p = g_pipe_ns; }   // the replay time so far (gfx_vk_present.c: a frame's cost for the adaptive rate)
 // flicker experiments (DM_CTL env lines, read every submission): DM_VK_X_NOSETC no descriptor set reuse, DM_VK_X_NODRVC no driver segment reuse, DM_VK_X_LANDCUT deferred
 // uniform updates land at each cut, DM_VK_X_NOKEEP no pass kept for the same targets, DM_VK_X_NOSHC no shadow reuse
 static int g_fdz = 1;  // DM_VK_FDZ (live): fragment-depth variants for draws on depth written by fragment shaders (pipeline key fdz)
@@ -91,6 +96,9 @@ static int g_vbound = 1;   // DM_VK_VBOUND (see vbuf_bound)
 // packaged uploads, the latter also apart), the copied pools' sync before it, shader modules, and the rest
 int g_prof_on; uint64_t g_prof_ns[8]; static uint64_t g_prof_t0, g_prof_pkg0, g_prof_npkg0, g_prof_pipes0;
 static int g_async_pipe = 1;   // DM_VK_ASYNC_PIPE (see async_pipe)
+// DM_VK_ASYNC_FIRST=1 (start-up): a draw into an attachment drawn in fewer than 3 presents in a row gets its pipeline in the background too (the draw is left out until
+// it is there) instead of built here. Batman: Arkham Knight's cutscenes stood still for 100-1000 ms frames in submit+present, with new targets and shader variants
+static int g_async_first = -1;
 static int g_lin_back = 1;   // DM_VK_LIN_BACK (see lin_back)
 static int g_samp_snap = 1;   // DM_NVN_SAMP_SNAP=0 (live): samplers as registered now, not as the bind saw them (gfx_vk_tex.c vk_samp_at)
 static uint64_t g_x_flat[8]; static int g_x_flat_mode[8], g_x_nflat;   // DM_VK_X_FLAT_VS=<vertex shader key>[:mode][,...] (debugging; pipelines made after it is set): mode bits 1 solid magenta pixel shader, 2 no depth test, 4 no blending (7 when left out)
@@ -107,6 +115,11 @@ static volatile int g_trace_frame; static int g_tf_dl, g_tf_draws;
 static int g_is_collect; static void istat_note(vkimg_t *im);
 // DM_VK_X_NOMEMOFIX=1 (live, A/B): a set memo hit keeps the dynamic offsets of its constant buffers unchecked while their generations are unchanged (set_memo_get)
 static int g_x_nomemofix;
+// DM_VK_SET_WHY=1 (live): why each descriptor set is made new instead of found again in its submission (set_why_note; a line every 300 presents, vk_set_why_report)
+static int g_x_setwhy, g_x_nosetkeep = 1;   // g_x_nosetkeep: not DM_VK_X_SETKEEP (set_kept)
+// DM_VK_PEEK=<compute shader key> (live): every 300th dispatch of that shader logs the eight u32 at its storage buffer 3 + 0x4000 as the CPU sees them (the last finished
+// frame's): Batman: Arkham Knight's tiled lighting 13ce18766b89893e keeps its eight screen regions' light counts N there
+static uint64_t g_x_peek;
 // DM_VK_X_NOLAND=1 (live, A/B): deferred updates are not landed before a draw that reads them as vertices, indices or indirect arguments (vtx_land);
 // DM_VK_X_NOOUTMASK=1 (live, A/B): colour targets the fragment shader declares no output for keep their write mask
 static int g_x_noland, g_x_nooutmask; static uint64_t g_vtx_lands;
@@ -190,7 +203,7 @@ static void x_read(void) { const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws
     { const char *tz = getenv("DM_VK_TRACE_SIZE"); snprintf(g_x_tracesize, sizeof g_x_tracesize, "%s", tz ? tz : ""); } const char *e; g_x_nobar = (e = getenv("DM_VK_X_NOBAR")) && atoi(e); g_x_depth = (e = getenv("DM_VK_X_DEPTH")) && atoi(e); g_x_color = (e = getenv("DM_VK_X_COLOR")) && atoi(e);
     g_x_nosetc = (e = getenv("DM_VK_X_NOSETC")) && atoi(e); g_x_nodrvc = (e = getenv("DM_VK_X_NODRVC")) && atoi(e); g_x_landcut = (e = getenv("DM_VK_X_LANDCUT")) && atoi(e);
     g_x_nodispbar = (e = getenv("DM_VK_X_NODISPBAR")) && atoi(e);
-    g_x_noland = (e = getenv("DM_VK_X_NOLAND")) && atoi(e); g_x_nomemofix = (e = getenv("DM_VK_X_NOMEMOFIX")) && atoi(e); g_x_nooutmask = (e = getenv("DM_VK_X_NOOUTMASK")) && atoi(e);
+    g_x_noland = (e = getenv("DM_VK_X_NOLAND")) && atoi(e); g_x_nomemofix = (e = getenv("DM_VK_X_NOMEMOFIX")) && atoi(e); g_x_setwhy = (e = getenv("DM_VK_SET_WHY")) && atoi(e); g_x_nosetkeep = !((e = getenv("DM_VK_X_SETKEEP")) && atoi(e)); g_x_peek = (e = getenv("DM_VK_PEEK")) ? strtoull(e, NULL, 16) : 0; g_x_nooutmask = (e = getenv("DM_VK_X_NOOUTMASK")) && atoi(e);
     g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
     g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : 1; if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
     g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 0; g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e); g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) && atoi(e);
@@ -391,7 +404,7 @@ static int pass_commit(void) {
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) VKLOG("=== traced pass %d: %ux%u, colour formats %d %d, depth format %d", g_x_tracepass, S.pass_w, S.pass_h, S.cfmt[0], S.cfmt[1], S.dfmt); g_pass_draws = 0; g_pass_bb[0] = g_pass_bb[1] = INT32_MAX; g_pass_bb[2] = g_pass_bb[3] = INT32_MIN;
     return 1;
 }
-void vk_ubd_land(VkCommandBuffer cb); int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off); void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst);
+void vk_ubd_land(VkCommandBuffer cb); int vk_ubd_shadow(uint64_t a, uint64_t n, uint64_t need, VkBuffer *buf, VkDeviceSize *off); void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst);
 // DM_VK_PASSDUMP=1 (a DM_CTL "env" line; =N waits N - 1 presents first): the next submissions' passes each leave their first colour target in a buffer (up to 48 passes), written as
 // DM_ROOT/pass_NN.ppm when the GPU is done (RGBA8 as is, RGBA16F clamped to 0..1, with its NaN / infinite pixel count logged)
 // DM_VK_PASSDUMP_SKIP=n (read when a dump starts): leave out each submission's first n passes, to reach a frame's later passes (Xenoblade Chronicles 3's title frame has about 200);
@@ -1072,7 +1085,8 @@ static void *async_pipe_thread(void *arg) {
 static int async_pipe(const pkey *k) {   // 1: queued (the draw is left out); under nothing (takes g_pipe_mu)
     if (!g_async_pipe || k->raster_discard || (S.sh[0] && S.sh[0]->xfb) || (S.sh[2] && S.sh[2]->xfb)) return 0;
     for (int i = 0; i < S.ncol && i < 8; i++) if (S.rt_has_col[i] && (S.rt_col[i].d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 0;   // (the CPU reads it: lin_back)
-    int natt = 0; for (int i = 0; i < 9; i++) { const vkimg_t *a = P_att[i].im; if (!a) continue; natt++; if (a->rt_frames < 3) {
+    if (g_async_first < 0) { const char *e = getenv("DM_VK_ASYNC_FIRST"); g_async_first = e && atoi(e); }
+    int natt = 0; for (int i = 0; i < 9; i++) { const vkimg_t *a = P_att[i].im; if (!a) continue; natt++; if (a->rt_frames < 3 && !g_async_first) {
             if (g_prof_on) { static int n; if (n++ < 300) VKLOG("pipeline built here: attachment %d %ux%u nvn format %#x drawn in %llu presents in a row (shaders %016llx %016llx)", i, a->w, a->h, a->nvn_format, (unsigned long long)a->rt_frames, (unsigned long long)k->key[0], (unsigned long long)k->key[1]); }
             return 0; } }   // (counted in this present too)
     if (!natt) return 0;
@@ -1090,7 +1104,7 @@ static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     if (p) { g_last_k = *k; g_last_p = p; return p == (void *)1 ? VK_NULL_HANDLE : p; }
     if (async_pipe(k)) return VK_NULL_HANDLE;
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
-    uint64_t tb = g_prof_on ? tick() : 0; p = build_pipeline(k, layout, stg); if (g_prof_on) g_prof_ns[0] += tick() - tb; g_vkst.pipes_built++;
+    uint64_t tb = tick(); p = build_pipeline(k, layout, stg); uint64_t tbd = tick() - tb; if (g_prof_on) g_prof_ns[0] += tbd; g_vkst.pipes_built++; g_pipe_ns += tbd;
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);
     if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
@@ -1386,7 +1400,13 @@ static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImag
 // view, sampler and texel buffer view written), and driver segments by their bytes. Unity draws many times with the same bindings, and every new set
 // is an allocation and a vkUpdateDescriptorSets; the driver segment's copy is shared so that a set using it can match.
 enum { SETC = 8192, DRVC = 1024 };
-static struct { uint64_t h, epoch; VkDescriptorSetLayout l; VkDescriptorSet set; } g_setc[SETC];
+static struct { uint64_t h, epoch, fgen; VkDescriptorSetLayout l; VkDescriptorSet set; int slot; uint32_t rgen; } g_setc[SETC];   // slot, rgen, fgen: kept over submissions (set_kept)
+int vk_cur_slot(void); uint32_t vk_slot_rgen(int slot); void vk_slot_hold(int slot); uint64_t vk_free_gen(void);
+// C2 (Batman: Arkham Knight, 393 of 449 new sets a frame had the content of a set made in an earlier submission; the cache was per submission, and DM_VK_CB_DRAWS cuts
+// one every 128 draws): a set of an earlier submission is found again while its slot's pools were not reset since (vk_slot_rgen) and no image, view or buffer was destroyed
+// since (vk_free_gen: a handle may come back for a new object); binding it holds that slot's pools until this submission is done (vk_slot_hold). DM_VK_X_SETKEEP=1 (live) turns it on; off, per submission as before:
+// on the OnePlus 10 Pro (Batmobile save, 1,150 draws) it made frames slower, 94-99 ms against 78 (sets 44 against 49 ms, but GPU 88-90 against 73 ms: recycling waits on the holds)
+static int set_kept(unsigned k) { return !g_x_nosetkeep && g_setc[k].set && g_setc[k].fgen == vk_free_gen() && vk_slot_rgen(g_setc[k].slot) == g_setc[k].rgen; }
 // Keep equality bytes in ordinary CPU memory: mapped scratch may be uncached.
 // The maximum live prefix is c2's 0x968 bytes; bytes beyond each prefix are zero.
 // GPU-written segments must stay outside this immutable cache.
@@ -1425,6 +1445,37 @@ static void vk_cross(int k, uint64_t a, uint64_t n, const vkpool_t *p) {
     uint64_t c = ++g_cross[k]; if (!(c & (c - 1))) VKLOG("%s%llu %s across a memory pool chunk's end (this one %#llx +%#llx, the chunk ends at %#llx)", k == 1 || k == 3 ? "[RED] " : "", (unsigned long long)c, what[k],
                                                            (unsigned long long)a, (unsigned long long)n, (unsigned long long)p->hi);
 }
+// DM_VK_UBO_TRIM=1 (read at start-up): a deferred update's shadow (vk_ubd_shadow) holds only the bytes of the constant buffer the shader reads, and an update past them needs
+// no shadow. The translator declares every constant buffer as vec4[4096] (64 KB) and Unreal Engine 3 binds it so, while a shader reads a few hundred bytes of it: Batman: Arkham
+// Knight copied 11.5 MB of shadows a frame out of pool memory, 52% of the OP's render thread in memcpy (simpleperf). The bytes read are found once per shader from its SPIR-V:
+// the highest constant index of the access chains into the binding's variable; a dynamic index, or any other use of the variable, keeps the whole range
+static int g_x_ubotrim = -1;
+static uint32_t spv_cb_used(const uint32_t *w, uint32_t n, uint32_t binding) {
+    const uint32_t FULL = 65536; if (!w || n < 5 || w[3] > (1u << 22)) return FULL;
+    uint32_t bound = w[3], var = 0, mx = 0, *val = malloc(sizeof *val * bound); uint8_t *has = calloc(bound, 1); if (!val || !has) { free(val); free(has); return FULL; }
+    for (uint32_t i = 5; i < n; ) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len || i + len > n) { var = 0; break; }
+        if (op == 71 && len == 4 && w[i + 2] == 33 && w[i + 3] == binding) var = w[i + 1];   // OpDecorate <id> Binding <binding>
+        if (op == 43 && len == 4 && w[i + 2] < bound) { has[w[i + 2]] = 1; val[w[i + 2]] = w[i + 3]; }   // OpConstant (32-bit)
+        i += len; }
+    for (uint32_t i = 5; var && i < n && mx < FULL; ) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16, use = 0;
+        for (uint32_t k = 1; k < len; k++) use |= w[i + k] == var;
+        // (OpName, OpEntryPoint, OpDecorate, OpVariable name it without reading it)
+        if (use && op != 5 && op != 15 && op != 71 && op != 59) {
+            if ((op == 65 || op == 66) && len >= 6 && w[i + 3] == var && w[i + 4] < bound && w[i + 5] < bound && has[w[i + 4]] && !val[w[i + 4]] && has[w[i + 5]]) {   // OpAccessChain var 0 <constant index>
+                uint32_t e = (val[w[i + 5]] + 1) * 16; if (e > mx) mx = e; }
+            else mx = FULL; }
+        i += len; }
+    free(val); free(has);
+    return !var ? FULL : mx > FULL ? FULL : mx ? mx : 16;
+}
+static uint32_t cb_used(const vkshader_t *cs, const dmsv_bind *b) {
+    vkshader_t *s = (vkshader_t *)cs; int i = (int)(b - s->b); if (i < 0 || i >= s->nbind) return 65536;
+    if (!s->cbused) s->cbused = calloc((size_t)s->nbind, sizeof *s->cbused); if (!s->cbused) return 65536;
+    if (!s->cbused[i]) { s->cbused[i] = spv_cb_used(s->spv, s->nspv, b->binding);
+        static uint64_t nb, full, sum; nb++; full += s->cbused[i] == 65536; sum += s->cbused[i];
+        if (!(nb & (nb - 1)) && nb >= 64) VKLOG("constant buffers read (DM_VK_UBO_TRIM): %llu bindings, %llu of them whole, on average %.0f bytes", (unsigned long long)nb, (unsigned long long)full, (double)sum / (double)nb); }
+    return s->cbused[i];
+}
 // a constant buffer binding's descriptor (stage_set, set_memo_get): its pool's buffer from the alignment boundary below it, or the shadow of the deferred updates over it
 static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
     const p_bind_buf *u = b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
@@ -1449,9 +1500,41 @@ static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescrip
         n = p->hi - p->lo - off;
     }
     ubo_log(s, st, b->reg, u->addr, n);
-    if (vk_ubd_shadow(u->addr, n, &buf, &off)) { *bi = (VkDescriptorBufferInfo){buf, off, n}; return; }   // deferred updates in it: their shadow
+    if (g_x_ubotrim < 0) { const char *e = getenv("DM_VK_UBO_TRIM"); g_x_ubotrim = e && atoi(e); }
+    uint64_t need = g_x_ubotrim && s ? cb_used(s, b) : n; if (need > n) need = n;
+    if (vk_ubd_shadow(u->addr, n, need, &buf, &off)) { *bi = (VkDescriptorBufferInfo){buf, off, need}; return; }   // deferred updates in it: their shadow
     VkDeviceSize al = V.props.limits.minUniformBufferOffsetAlignment; if (off % al) VKRED_ONCE(40, "uniform buffer at an offset not aligned to %llu", (unsigned long long)al);
     *bi = (VkDescriptorBufferInfo){buf, p->boff + off - off % al, n + off % al};   // (off is from the pool's start, its buffer starts boff before it)
+}
+// DM_VK_SET_WHY: per stage the last set's writes; a set made new is put down to the first thing that differs from them: the same content in an earlier submission
+// (the cache is per submission, and DM_VK_CB_DRAWS cuts one every 128 draws), another shader or layout, a constant buffer's buffer (a deferred update's shadow is scratch
+// memory of its own) or its offset and range, an image view, a sampler, a texel buffer; nothing different: its cache slot was taken by another set
+enum { WHY_EPOCH, WHY_SLOT, WHY_SHADER, WHY_UBO_BUF, WHY_UBO_OFF, WHY_IMAGE, WHY_SAMPLER, WHY_TEXEL, WHY_N };
+static uint64_t g_why[WHY_N], g_why_hits;
+static struct { const void *dsl; uint32_t n; uint64_t a[96], b[96]; uint8_t t[96]; } g_lastw[6];
+static void set_why_note(int st, const VkWriteDescriptorSet *w, uint32_t nw, VkDescriptorSetLayout dsl, int hit, int same_earlier) {
+    if (st < 0 || st > 5) return;
+    uint64_t a[96], b[96]; uint8_t t[96]; uint32_t n = nw < 96 ? nw : 96;
+    for (uint32_t i = 0; i < n; i++) { const VkWriteDescriptorSet *x = &w[i];
+        if (x->pBufferInfo) { t[i] = 0; a[i] = (uint64_t)x->pBufferInfo->buffer; b[i] = x->pBufferInfo->offset * 1000003u ^ x->pBufferInfo->range; }
+        else if (x->pImageInfo) { t[i] = 1; a[i] = 0; b[i] = 0; for (uint32_t j = 0; j < x->descriptorCount; j++) { a[i] = a[i] * 31 + (uint64_t)x->pImageInfo[j].imageView; b[i] = b[i] * 31 + (uint64_t)x->pImageInfo[j].sampler; } }
+        else { t[i] = 2; a[i] = x->pTexelBufferView ? (uint64_t)x->pTexelBufferView[0] : 0; b[i] = 0; } }
+    if (hit) g_why_hits++;
+    else if (same_earlier) g_why[WHY_EPOCH]++;
+    else if (g_lastw[st].dsl != (const void *)dsl || g_lastw[st].n != n) g_why[WHY_SHADER]++;
+    else { int why = WHY_SLOT;
+        for (uint32_t i = 0; i < n; i++) if (t[i] != g_lastw[st].t[i] || a[i] != g_lastw[st].a[i] || b[i] != g_lastw[st].b[i]) {
+            why = t[i] == 0 ? (a[i] != g_lastw[st].a[i] ? WHY_UBO_BUF : WHY_UBO_OFF) : t[i] == 1 ? (a[i] != g_lastw[st].a[i] ? WHY_IMAGE : WHY_SAMPLER) : WHY_TEXEL; break; }
+        g_why[why]++; }
+    g_lastw[st].dsl = (const void *)dsl; g_lastw[st].n = n; memcpy(g_lastw[st].a, a, n * 8); memcpy(g_lastw[st].b, b, n * 8); memcpy(g_lastw[st].t, t, n);
+}
+void vk_set_why_report(void) {   // gfx_vk_present.c, every 300 presents
+    uint64_t tot = g_why_hits; for (int i = 0; i < WHY_N; i++) tot += g_why[i];
+    if (!tot) return;
+    VKLOG("descriptor sets (last 300 presents, per frame): found again %.0f, made new %.0f: same content in an earlier submission %.0f, cache slot taken %.0f, other shader or layout %.0f, "
+          "constant buffer elsewhere (a shadow or another buffer) %.0f, constant buffer offset or range %.0f, image view %.0f, sampler %.0f, texel buffer %.0f", g_why_hits / 300.0, (tot - g_why_hits) / 300.0,
+          g_why[WHY_EPOCH] / 300.0, g_why[WHY_SLOT] / 300.0, g_why[WHY_SHADER] / 300.0, g_why[WHY_UBO_BUF] / 300.0, g_why[WHY_UBO_OFF] / 300.0, g_why[WHY_IMAGE] / 300.0, g_why[WHY_SAMPLER] / 300.0, g_why[WHY_TEXEL] / 300.0);
+    memset(g_why, 0, sizeof g_why); g_why_hits = 0;
 }
 // The set a stage's last draw got, and what it was built from. Between two draws most stages change no texture, sampler, image or storage buffer, only
 // the offsets of their constant buffers, which go to the bind (dynamic uniform buffers). Then nothing is collected or hashed: the constant buffers alone are
@@ -1641,11 +1724,13 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
         else if (x->pTexelBufferView) h = fnv(h, x->pTexelBufferView, sizeof *x->pTexelBufferView);
     }
     unsigned k = (unsigned)(h % SETC); uint64_t tb2 = tick(); g_ns_set_hash += tb2 - tb1;
-    if (g_setc[k].epoch == g_set_epoch && g_setc[k].h == h && g_setc[k].l == s->dsl && !(g_tracing && !g_trace_frame) && !g_x_nosetc) { g_set_hits++; set = g_setc[k].set; }
+    int same = g_setc[k].h == h && g_setc[k].l == s->dsl, here = same && (g_setc[k].epoch == g_set_epoch || set_kept(k));
+    if (g_x_setwhy) set_why_note(st, w, nw, s->dsl, here, same);
+    if (here && !(g_tracing && !g_trace_frame) && !g_x_nosetc) { g_set_hits++; set = g_setc[k].set; if (g_setc[k].epoch != g_set_epoch) vk_slot_hold(g_setc[k].slot); }
     else { set = vk_alloc_set(s->dsl); g_set_new++;
         for (uint32_t i = 0; i < nw; i++) w[i].dstSet = set;
         vkUpdateDescriptorSets(V.dev, nw, w, 0, NULL);
-        g_setc[k].h = h; g_setc[k].epoch = g_set_epoch; g_setc[k].l = s->dsl; g_setc[k].set = set; g_ns_set_new += tick() - tb2; }
+        g_setc[k].h = h; g_setc[k].epoch = g_set_epoch; g_setc[k].l = s->dsl; g_setc[k].set = set; g_setc[k].slot = vk_cur_slot(); g_setc[k].rgen = vk_slot_rgen(g_setc[k].slot); g_setc[k].fgen = vk_free_gen(); g_ns_set_new += tick() - tb2; }
     // verify: the same content (hash), integer-texel bindings and dynamic offsets as the memo gave. A lone difference in dofs alone can be a driver segment
     // copied again after its g_drvc entry was taken by another (the memo's copy is as good); anything repeated is a dependency the memo misses
     if (verify && (h != g_smemo[st].h || g_num_um != vum || g_num_im != vim || memcmp(vd, dofs, sizeof *dofs * (size_t)s->ndyn))) { g_set_memo_bad++; static int n;
@@ -2288,7 +2373,10 @@ static VkPipeline compute_build(vkshader_t *cs, uint64_t um, uint64_t im) {   //
     int bs = build_begin();   // (the crash dump's note: build_pipeline)
     if (bs >= 0) { snprintf(g_build[bs].what, sizeof g_build[bs].what, "compute pipeline, shader %016llx, integer-texel views %#llx/%#llx", (unsigned long long)cs->key, (unsigned long long)um, (unsigned long long)im); g_build[bs].phase = 1; }
     // DM_VK_SPV_ALT=1 in env.txt (with DM_VK_SPV_DIR): compute shaders take the alternative code too, from the start (compute_warm builds them all then, and they are kept)
-    static int alt = -1; if (alt < 0) { const char *e = getenv("DM_VK_SPV_ALT"); alt = e && atoi(e); }
+    // DM_VK_SPV_CS=1 (with DM_VK_SPV_DIR): only compute shaders do, the graphics pipelines keep the bundle's code and their cache. A compute shader put through spirv-opt -O
+    // that way: Batman: Arkham Knight's tiled lighting (752e5bf8b7496d94, 45% of its GPU time) took 15.0-15.2 ms against 17.9-18.8 on the OP. The file is made from the game's own
+    // shader: it stays on the device, never in git
+    static int alt = -1; if (alt < 0) { const char *e = getenv("DM_VK_SPV_ALT"), *c = getenv("DM_VK_SPV_CS"); alt = (e && atoi(e)) || (c && atoi(c)); }
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(VK_SHADER_STAGE_COMPUTE_BIT, cs->local), 0, VK_SHADER_STAGE_COMPUTE_BIT, vk_shader_module(cs, um, im, alt && !um && !im ? 1u << 31 : 0, 0), "main", NULL}, vk_pipeline_layout(dsl, 1), VK_NULL_HANDLE, -1};   // (pNext: DM_VK_SUBGROUP_PIN)
     if (bs >= 0) g_build[bs].phase = 2;
     VkResult r = vkCreateComputePipelines(V.dev, V.pcache, 1, &ci, NULL, &p); build_end(bs);
@@ -2353,6 +2441,9 @@ static void dispatch(const p_dispatch *d) {
     // tiles it wrote only 0-61. Indirect counts are copied on the GPU into a fresh c0 segment below
     g_dispatch[0] = (uint32_t)d->x; g_dispatch[1] = (uint32_t)d->y; g_dispatch[2] = (uint32_t)d->z;
     VkDescriptorBufferInfo indirect_c0 = {0};
+    if (g_x_peek && cs->key == g_x_peek) { static unsigned np; if (np++ % 300 == 0) { const p_bind_buf *u = &S.ssbo[5][3]; uint32_t v[8] = {0};
+        if (u->addr && u->size >= 0x4020) memcpy(v, (const void *)(uintptr_t)(u->addr + 0x4000), sizeof v);
+        VKLOG("peek %016llx (dispatch %u): s3 %#llx +%#llx, words at +0x4000: %u %u %u %u %u %u %u %u", (unsigned long long)cs->key, np, (unsigned long long)u->addr, (unsigned long long)u->size, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]); } }
     if (g_trace_frame) { g_tracing = 1; g_tf_dl = 0; g_tf_draws++; VKLOG("dispatch: shader %016llx groups %d %d %d%s, after pass %d", (unsigned long long)cs->key, (int)d->x, (int)d->y, (int)d->z, d->ind ? " (indirect)" : "", g_sub_pass - 1); }
     uint32_t dofs[96]; VkDescriptorSet set = stage_set(5, cs, dofs, d->ind ? &indirect_c0 : NULL);
     if (g_trace_frame) g_tracing = 0;
@@ -2379,7 +2470,7 @@ static void dispatch(const p_dispatch *d) {
         vkCmdDispatchIndirect(cb, b, o);   // the same snapshot supplies both the dispatch and the shader's group counts
     }
     else vkCmdDispatch(cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
-    vk_pass_ts(1, (uint32_t)d->x, (uint32_t)d->y, PT_DISPATCH, (uint32_t)d->z);
+    void vk_pass_ts_key(uint64_t k); vk_pass_ts_key(cs->key); vk_pass_ts(1, (uint32_t)d->x, (uint32_t)d->y, PT_DISPATCH, (uint32_t)d->z);
     if (!g_x_nodispbar || g_is_collect) vk_img_barrier_all(cb);   // (image statistics read what the dispatch wrote) DM_VK_X_NODISPBAR=1 (live, a cost measurement that may draw wrong): no barrier after the dispatch
     istat_flush();   // (while the image statistics collect: what this dispatch bound or wrote)
     if (crumbs_on()) { crumb_t *c = crumb_cur(); if (c->n < 8) { c->k[c->n][0] = 0; c->k[c->n][1] = 0; c->k[c->n][2] = cs->key; c->n++; } crumb_mark(1); }

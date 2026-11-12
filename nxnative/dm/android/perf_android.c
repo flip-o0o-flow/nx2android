@@ -39,14 +39,16 @@ static struct {
 } H;
 static APerformanceHintSession *g_hint; static int64_t g_hint_target; static int32_t g_hint_tids[8]; static int g_hint_n;
 static AWorkDuration *g_wd;   // made once, its fields set for each frame's report
+static void rearm_tick(void);   // (DM_RESUME_REARM, below)
 
 static int64_t perf_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
 
 // DM_GPU_TURBO=1 (live, read every 60 presents): Adreno's GPU at its highest clock (thermal limits still apply) through the KGSL property libadrenotools'
 // adrenotools_set_turbo sets: power control off on /dev/kgsl-3d0; 0 gives it back. A frame held at 30 fps lets the GPU governor lower the clock until the work
 // fills the frame, so its GPU time says little about what 60 would need. Any Vulkan driver on KGSL (Qualcomm's, Turnip)
+static int g_turbo_on;   // what gpu_turbo last set (dm_perf_resumed forgets it, so it is set again)
 static void gpu_turbo(void) {
-    static int on;   // what was last set
+    int on = g_turbo_on;
     const char *e = getenv("DM_GPU_TURBO"); int want = e && atoi(e) > 0;
     if (want == on) return;
     struct { unsigned type; void *value; size_t size; } prop; uint32_t enable = !want;   // (kgsl.h kgsl_device_getproperty; KGSL_PROP_PWRCTRL 0xE: 0 = power control off)
@@ -54,7 +56,7 @@ static void gpu_turbo(void) {
     int fd = open("/dev/kgsl-3d0", O_RDWR); int r = fd < 0 ? -1 : ioctl(fd, _IOW(0x09, 0x32, prop), &prop);   // IOCTL_KGSL_SETPROPERTY
     if (fd >= 0) close(fd);
     if (r) { LOG("[RED] [perf] DM_GPU_TURBO=%d: the GPU's power control could not be set (%s)", want, strerror(errno)); return; }
-    on = want; LOG("[perf] DM_GPU_TURBO=%d: %s", want, want ? "the GPU at its highest clock (power control off)" : "the GPU's own clock control again");
+    g_turbo_on = want; LOG("[perf] DM_GPU_TURBO=%d: %s", want, want ? "the GPU at its highest clock (power control off)" : "the GPU's own clock control again");
 }
 
 static void hint_init(int64_t target) {
@@ -172,6 +174,19 @@ static int fps_pin(void) {   // a DM_CTL "env DM_FPS_PIN=40" line holds that ste
 // of ~24 ms GPU time, and the display's switch to 120 Hz and the missed frames made 80-550 ms frames
 static int64_t g_frame_cost, g_frame_gpu;
 void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns) { g_frame_cost = replay_ns > gpu_ns ? replay_ns : gpu_ns; g_frame_gpu = gpu_ns; }
+// DM_ADAPT_HYST=1 (start-up): the steps follow the display and wait longer before moving. A step whose period is not a whole number of the display's refreshes is
+// skipped (45 fps at 90 Hz goes to 30, not 40), as is one no longer than the period presentation is paced to anyway (DM_FPS_CAP 40: the 60 and 40 steps both give
+// 25 ms); down only after the frames ran late for DM_ADAPT_DOWN_MS (2000) in a row; up only DM_ADAPT_UP_AFTER_S (20) after a step down and when the judged
+// percentile is under DM_ADAPT_UP_FRAC percent (85) of the shorter period. Batman: Arkham Knight on the Red Magic at a 40 cap went 40 → 30 after ~4 s (p90 29.7 ms),
+// 30 → 40 in a menu and back, while its frames' median fitted 25 ms (23.4) and only the tail did not
+static int g_hyst = -1; static int64_t g_down_ms = 2000, g_up_after = 20000000000ll; static int g_up_frac = 85; static int64_t g_late_since;
+static int step_ok(int st) {   // DM_ADAPT_HYST: a step the rate may take
+    double vk_refresh_ms(void);
+    if (!g_hyst || st == 0) return 1;
+    if (g_game_period && (uint64_t)STEPS[st] <= g_game_period) return 0;
+    double r = vk_refresh_ms(); if (r <= 0) return 1;
+    double k = STEPS[st] / 1e6 / r, f = k - (double)(int64_t)(k + 0.5); return f > -0.03 * k && f < 0.03 * k;
+}
 // The frame's work to the CPU hint: with the GPU's time where Android 15 takes it, and a load increase signalled (Android 16) when 3 frames in a row run over
 // the period, at most every 0.5 s: the clocks then follow the whole frame and not only its CPU half. (Super Mario Odyssey on the Red Magic Astra fell from 60
 // to 30-45 fps with the GPU at 222-443 MHz in the same scene; that device's GPU clock moved only with its FULL performance mode or its game menu, hints or not)
@@ -226,9 +241,25 @@ static void adapt_frame(int64_t work, int64_t now) {
     // Judged on the 90th percentile of the last 64 frames' work, from 4 s after a change: the GPU and CPU clocks take a few seconds to rise for a shorter
     // period, and with the 95th percentile against 95% of the period NEO's crowd fell back from 40 to 30 fps within 2 s every time, though pinned at
     // 40 it held 24.4 ms frames (p90 work 24.9 ms, p95 frame time 34-36 ms: no worse than its 30 fps p95 of 35-37 ms)
+    if (g_hyst < 0) { const char *e = getenv("DM_ADAPT_HYST"); g_hyst = e && atoi(e);
+        if (g_hyst) { if ((e = getenv("DM_ADAPT_DOWN_MS"))) g_down_ms = atoll(e); if ((e = getenv("DM_ADAPT_UP_AFTER_S"))) g_up_after = atoll(e) * 1000000000ll; if ((e = getenv("DM_ADAPT_UP_FRAC")) && atoi(e) > 0) g_up_frac = atoi(e);
+            LOG("[perf] adaptive frame rate with hysteresis: steps on the display's refreshes, down after %lld ms late, up %lld s after a step down below %d%% of the period", (long long)g_down_ms, (long long)(g_up_after / 1000000000ll), g_up_frac); } }
     if (now - g_last_change < 4000000000ll) return;
     int64_t p90 = work_pct(90); if (!p90) return;
     int nsteps = (int)(sizeof STEPS / sizeof *STEPS);
+    if (g_hyst) {
+        int dn = g_step + 1; while (dn < nsteps && !step_ok(dn)) dn++;
+        int late = shown_late(), over = dn < nsteps && p90 > STEPS[g_step] * 105 / 100 && (late < 0 || late >= 7);
+        if (!over) g_late_since = 0; else if (!g_late_since) g_late_since = now;
+        if (over && now - g_late_since >= g_down_ms * 1000000ll) {
+            g_step = dn; g_last_change = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0; g_late_since = 0;
+            LOG("[perf] adaptive frame rate: %.0f fps (frames p90 %.1f ms, late on screen %d of 64, late for %lld ms)", 1e9 / STEPS[g_step], p90 / 1e6, late, (long long)g_down_ms); return; }
+        int up = g_step - 1; while (up > 0 && !step_ok(up)) up--;
+        if (g_step > 0 && up >= 0 && up != g_step && p90 < STEPS[up] / 100 * g_up_frac && now - g_last_change >= g_up_after) {
+            if (++g_ok_frames > 120) { g_step = up; g_last_change = g_last_up = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0; LOG("[perf] adaptive frame rate: %.0f fps (frames p90 %.1f ms)", 1e9 / STEPS[g_step], p90 / 1e6); } }
+        else g_ok_frames = 0;
+        return;
+    }
     if (g_step + 1 < nsteps && p90 > STEPS[g_step] * 105 / 100) {
         // only when the frames miss the display too: at least 1 in 10 of the last 64 on screen (as the 90th percentile), or no readings to tell
         int late = shown_late(); if (late >= 0 && late < 7) g_held_back++;   // veto only the downshift: the chosen upshift percentile may still fit
@@ -263,6 +294,7 @@ void dm_perf_frame(double period) {
     if (g_game_period && (int64_t)g_game_period < p) p = (int64_t)g_game_period;
     hint_init(p);
     { static unsigned n; if (++n % 60 == 0) gpu_turbo(); }
+    rearm_tick();
     if (g_work_start) {   // (a longer span: the game was held, by the pause menu or the background)
         int64_t w = g_prev_present ? t - g_prev_present - g_pace : t - g_work_start;
         int64_t pq = g_prev_present ? g_pq : 0, pace = g_step > 0 ? pq : 0;   // (t - g_work_start starts after the wait already)
@@ -275,10 +307,46 @@ void dm_perf_frame(double period) {
     if (p != g_hint_target && H.update) { H.update(g_hint, p); g_hint_target = p; }
 }
 
+// DM_RESUME_REARM=1 (start-up): when the game comes back from the background (dm_gfx_suspend 0), the CPU hint session is made again with the threads it had,
+// a load increase is signalled for the CPU and the GPU every 0.5 s for 2 s, and the GPU turbo is set again. After a focus change the OP ran its replay and its GPU
+// 2-3x slower for ~5 s and somewhat slower for 15-30 s more (Batman: Arkham Knight, focusrun), the Red Magic 23 frames over 100 ms
+static int64_t g_rearm_until;
+void dm_perf_resumed(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_RESUME_REARM"); on = e && atoi(e); }
+    if (!on) return;
+    static int64_t last; int64_t t0 = perf_now(); if (last && t0 - last < 3000000000ll) return; last = t0;   // (a suspend and the focus coming back both call it)
+    g_turbo_on = -1; gpu_turbo();
+    if (g_hint && H.create && H.get) {
+        void (*close_)(APerformanceHintSession *) = (void (*)(APerformanceHintSession *))dlsym(RTLD_DEFAULT, "APerformanceHint_closeSession");
+        APerformanceHintSession *n = H.create(H.get(), g_hint_tids, (size_t)g_hint_n, g_hint_target ? g_hint_target : 33333333);
+        if (n) { if (close_) close_(g_hint); g_hint = n; }
+        LOG("[perf] resumed: CPU hint session %s (%d threads)%s", n ? "made again" : "kept (a new one was refused)", g_hint_n, H.increase ? ", load increases for 2 s" : "");
+    } else LOG("[perf] resumed: no CPU hint session to make again%s", g_turbo_on > 0 ? "; GPU turbo set again" : "");
+    g_rearm_until = perf_now() + 2000000000ll;
+}
+static void rearm_tick(void) {   // dm_perf_frame: the load increases after a resume
+    static int64_t last; int64_t t = perf_now();
+    if (!g_rearm_until || t > g_rearm_until || !g_hint || !H.increase || t - last < 500000000ll) return;
+    last = t; H.increase(g_hint, true, true, "resumed");
+}
 // The window's frame rate: the game's rate, so the display can pick a mode it divides (60 / 120 Hz rather than 144 Hz for a 60 fps game).
+// DM_DISPLAY_HZ (start-up): the display rate asked for instead of the frame rate. "auto": the highest of 120 / 90 / 60 Hz the frame rate divides (40 and 30 → 120,
+// 45 → 90), <n>: n Hz; asked with the change strategy ALWAYS (Android 12+), so the display changes even where the switch is not seamless. The Red Magic stayed at
+// 60 Hz with a 40 fps cap until a focus change (rm16), then took 90; with auto 40 goes to 120
 void dm_perf_window(ANativeWindow *w, double fps) {
     if (!w || fps <= 0) return;
-    int r = ANativeWindow_setFrameRate(w, (float)fps, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
-    LOG("[perf] window frame rate %.0f fps%s", fps, r ? " refused" : "");
+    static int mode = -1; static double hz; const char *e;
+    if (mode < 0) { e = getenv("DM_DISPLAY_HZ"); mode = !e || !*e ? 0 : !strcmp(e, "auto") ? 1 : (hz = atof(e)) > 0 ? 2 : 0; }
+    double want = fps;
+    if (mode == 1) { static const double R[3] = {120, 90, 60}; for (int i = 0; i < 3; i++) { double k = R[i] / fps; if (k - (int)(k + 0.5) > -0.02 && k - (int)(k + 0.5) < 0.02) { want = R[i]; break; } } }
+    else if (mode == 2) want = hz;
+    int r;
+    static int (*with_strategy)(ANativeWindow *, float, int8_t, int8_t) = (void *)1;
+    if (with_strategy == (void *)1) with_strategy = (int (*)(ANativeWindow *, float, int8_t, int8_t))dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRateWithChangeStrategy");
+    if (mode && with_strategy) r = with_strategy(w, (float)want, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, 1 /* ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS */);
+    else r = ANativeWindow_setFrameRate(w, (float)want, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+    double vk_refresh_ms(void); double now = vk_refresh_ms();
+    LOG("[perf] window frame rate %.0f fps%s (display now %.1f Hz)", fps, r ? " refused" : "", now > 0 ? 1000.0 / now : 0.0);
+    if (mode && want != fps) LOG("[perf] display rate asked: %.0f Hz (DM_DISPLAY_HZ)", want);
 }
 

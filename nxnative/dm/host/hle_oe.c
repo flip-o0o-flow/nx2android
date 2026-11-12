@@ -74,6 +74,7 @@ void dm_focus_set(int st) {
     if (st == 1) atomic_store(&g_focus_in_ns, now_ns());
     if (atomic_exchange(&g_focus, st) == st) return;
     LOG("oe focus state → %d", st);
+    if (st == 1) { void dm_perf_resumed(void); dm_perf_resumed(); }   // (DM_RESUME_REARM: focus back, as after a suspend)
     if (focus_notifies()) mq_push(MSG_FOCUS);
 }
 static int opmode(void) { return dm_opmode(); }

@@ -107,15 +107,15 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
 
 // ---- the pause menu: a panel in the middle of the window: a row of tabs, the open tab's rows, and Resume. Everything is placed in a panel rectangle p
 // (x, y, width, height: the window's for touches, the raster's for drawing), so the touches and the drawing agree ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_PAD, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_PAD, OVM_EXIT, OVM_SHARPEN, OVM_FPSCAP, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
             // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
-            // OVM_PAD: a controller's face buttons by their position or by their label (front_android.c pad_labels)
-#define OVM_TABS 2
+            // OVM_PAD: a controller's face buttons by their position or by their label (front_android.c pad_labels); OVM_EXIT: ends the app, chosen twice (front_android.c menu_exit)
+#define OVM_TABS 3
 #define OVM_PER_TAB 5
-static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PAD}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, -1}};   // -1: no row
-static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Gamepad", "Game"};
+static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PAD}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_EXIT}, {OVM_SHARPEN, OVM_FPSCAP, -1, -1, -1}};   // Picture: OVM_SHARPEN (DM_VK_SHARPEN), OVM_FPSCAP (DM_FPS_CAP)   // -1: no row
+static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Gamepad", "Game", "Picture"};
 #define OVM_ROWS (OVM_PER_TAB + 2)   // the tabs, a tab's rows (as many for every tab: the panel keeps its size), Resume
-static inline int ov_menu_item(int tab, int row) { return row == 0 ? OVM_TAB : row == OVM_ROWS - 1 ? OVM_RESUME : row > 0 && row < OVM_ROWS - 1 ? OVM_TAB_ITEMS[tab & 1][row - 1] : -1; }
+static inline int ov_menu_item(int tab, int row) { return row == 0 ? OVM_TAB : row == OVM_ROWS - 1 ? OVM_RESUME : row > 0 && row < OVM_ROWS - 1 ? OVM_TAB_ITEMS[((tab % OVM_TABS) + OVM_TABS) % OVM_TABS][row - 1] : -1; }
 #define OV_MENU_ROW 0.115f   // row height, of the window's height
 #define OV_MENU_W 0.95f      // panel width, of the window's height
 #define OV_MENU_PAD 0.03f
@@ -180,6 +180,28 @@ static inline int ov_ed_button_at(float x, float y, const float p[4], int first,
 // ---- the save picker (front_android.c, from the menu's Import save): the pause menu's panel and rows, with what front_android.c puts in each row: the saves in
 // saves/ newest first, OVM_ROWS - 2 to a page (left and right page), then the confirmation, then the note that the game closes. dm_menu_state: bit 18, bits 4..7
 // the highlighted row + 1, bits 20..27 the picker's edit count (a page, a confirmation) ----
+// ---- button remapping (front_android.c, the menu's Remap buttons): which physical controller button each Switch button takes, kept per controller. A map is a
+// permutation of RM_N physical buttons over the RM_N Switch buttons: choosing a button already in use swaps the two (rm_assign), so none ever becomes unreachable ----
+enum { RM_N = 16 };
+static const char *const RM_SW_NAMES[RM_N] = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "+", "-", "Left stick press", "Right stick press", "D-pad up", "D-pad down", "D-pad left", "D-pad right"};
+static const uint64_t RM_SW_BITS[RM_N] = {DM_BTN_A, DM_BTN_B, DM_BTN_X, DM_BTN_Y, DM_BTN_L, DM_BTN_R, DM_BTN_ZL, DM_BTN_ZR, DM_BTN_PLUS, DM_BTN_MINUS, DM_BTN_LS, DM_BTN_RS,
+                                          DM_BTN_UP, DM_BTN_DOWN, DM_BTN_LEFT, DM_BTN_RIGHT};
+// the physical buttons by their place (Android's BUTTON_A is the bottom face button, B the right one, X the left, Y the top), whatever the controller prints on them
+static const char *const RM_PHYS_NAMES[RM_N] = {"Bottom face", "Right face", "Left face", "Top face", "L1", "R1", "L2", "R2", "Start", "Select", "L3", "R3", "D-pad up", "D-pad down", "D-pad left", "D-pad right"};
+// The presets: by position (the Switch's A is the right face button, as on a Switch) or by label (A is the button marked A on an Xbox-style controller: the bottom one)
+static inline void rm_preset(uint8_t m[RM_N], int labels) {
+    for (int i = 0; i < RM_N; i++) m[i] = (uint8_t)i;
+    if (!labels) { m[0] = 1; m[1] = 0; m[2] = 3; m[3] = 2; }
+}
+// Switch button sw takes physical button phys; the Switch button that had phys takes sw's old one (a swap keeps the map a permutation)
+static inline void rm_assign(uint8_t m[RM_N], int sw, int phys) {
+    if (sw < 0 || sw >= RM_N || phys < 0 || phys >= RM_N) return;
+    for (int j = 0; j < RM_N; j++) if (m[j] == phys) { m[j] = m[sw]; break; }
+    m[sw] = (uint8_t)phys;
+}
+static inline int rm_is_preset(const uint8_t m[RM_N], int labels) { uint8_t p[RM_N]; rm_preset(p, labels); for (int i = 0; i < RM_N; i++) if (m[i] != p[i]) return 0; return 1; }
+static inline uint64_t rm_bit_of(const uint8_t m[RM_N], int phys) { for (int i = 0; i < RM_N; i++) if (m[i] == phys) return RM_SW_BITS[i]; return 0; }   // the Switch button a physical one gives
+
 #define OVS_ST 0x40000
 enum { OVS_EMPTY, OVS_TITLE, OVS_ITEM, OVS_NOTE, OVS_BUTTON, OVS_BACK };   // a row: nothing; the title (left) and the page (right); a save (its name, its size);
 typedef struct { int style; char left[80], right[40]; } ov_srow;            // a line of text; a button (the import); Back or Cancel, centred as Resume is

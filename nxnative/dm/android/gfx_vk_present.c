@@ -12,6 +12,8 @@
 #include "pixel_font.h"
 #include "overlay_vert.spv.h"
 #include "overlay_frag.spv.h"
+#include "sharpen_vert.spv.h"
+#include "sharpen_frag.spv.h"
 #include "rot_vert.spv.h"
 #include "rot_frag.spv.h"
 
@@ -371,19 +373,22 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 }
 // The pause menu (overlay_layout.h: the rows, the tabs, the slider's track), in the raster's panel rectangle. Its letters are as large as a row allows (0.30 of
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
-static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save", "Face buttons", "Resume", ""};
-static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import"};   // the rows that are a button: its word
+static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save", "Remap buttons", "Exit game", "Sharpen", "FPS limit", "Resume", ""};
+static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_PAD] = "Remap"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
-static const char *const OVM_PADS[2] = {"Position", "Label"};   // a controller's face buttons (front_android.c pad_labels)
+static const char *const OVM_PADS[2] = {"Position", "Label"};
+static const char *const OVM_SHARPS[3] = {"Off", "Low", "High"};   // the Sharpen row (dm_menu_state bits 20-21 on the Picture tab)
+static const char *const OVM_FPSCAPS[4] = {"30", "40", "45", "60"};   // the FPS limit row (bits 22-23 on the Picture tab; 30 = the game's own rate)
+#define OVM_EXIT_ASK "Exit game: press again"   // the Exit game row once chosen (dm_menu_state bit 29), until it is chosen again or the menu closes   // a controller's face buttons (front_android.c pad_labels)
 static void ov_menu_panel(const ov_canvas *cv, int st) {
     float p[4] = {0, 0, (float)cv->w, (float)cv->h}, r[4]; ov_menu_rowrect(p, 0, r);
     float rh = r[3], rw = r[2], gap = rh * 0.35f, sh = rh * 0.40f, sw = sh * 1.85f;
-    int tab = st >> 8 & 1, sel = (st >> 4 & 15) - 1, op = st >> 9 & 127;
+    int tab = (st >> 8 & 1) | (st >> 30 & 1) << 1, sel = (st >> 4 & 15) - 1, op = st >> 9 & 127;   // (the tab's high bit at 30: front_android.c dm_menu_state)
     int is = (int)fmaxf(1, roundf(rh * 0.30f / PF_CAP));
     for (; is > 1; is--) {   // the widest row: its label, a gap and its control
         float need = 0;
         for (int i = 0; i < OVM_RESUME; i++) {
-            float lw = cv_text_w(OVM_LABELS[i], is), cw = i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : i == OVM_PAD ? 2 * (cv_text_w(OVM_PADS[0], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("OFF", is);
+            float lw = cv_text_w(i == OVM_EXIT ? OVM_EXIT_ASK : OVM_LABELS[i], is), cw = i == OVM_EXIT ? 0 : i == OVM_SHARPEN ? 3 * (cv_text_w(OVM_SHARPS[0], is) + sh) : i == OVM_FPSCAP ? 4 * (cv_text_w(OVM_FPSCAPS[0], is) + sh) : i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : i == OVM_PAD ? 2 * (cv_text_w(OVM_PADS[0], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("OFF", is);
             need = fmaxf(need, i == OVM_OPACITY ? fmaxf(lw / 0.38f, cv_text_w("80%", is) / 0.14f) : lw + gap + cw + rh * 0.3f);
         }
         if (need <= rw && cv_text_w(OVM_TAB_NAMES[0], is) < rw / 2 - sh) break;
@@ -402,7 +407,9 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             continue;
         }
         if (it == OVM_RESUME) { cv_rrect(cv, r[0], r[1], r[0] + rw, r[1] + 1, 0.5f, C_LINE); cv_text(cv, r[0] + (rw - cv_text_w("Resume", is)) / 2, cy, "Resume", is, C_ACCENT); continue; }
+        if (it == OVM_EXIT && st >> 29 & 1) { cv_text(cv, r[0] + rh * 0.15f, cy, OVM_EXIT_ASK, is, C_ACCENT); continue; }
         cv_text(cv, r[0] + rh * 0.15f, cy, OVM_LABELS[it], is, row == sel ? C_WHITE : C_DIM);
+        if (it == OVM_EXIT) continue;   // a row of its own: no control
         if (it == OVM_OPACITY) {   // the slider: its track, filled to the value, the knob and the percent
             float t[3]; ov_menu_track(p, row, t); float f = (float)(op - OV_OPACITY_MIN) / (OV_OPACITY_MAX - OV_OPACITY_MIN), th = fmaxf(2, rh * 0.08f), kr = rh * 0.20f;
             f = f < 0 ? 0 : f > 1 ? 1 : f;
@@ -417,6 +424,12 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             cv_text(cv, x1 - cv_text_w(v, vs), cy, v, vs, x == OVX_FAILED ? C_ACCENT : C_WHITE);
         } else if (OVM_BUTTONS[it]) {   // a button
             float bw = cv_text_w(OVM_BUTTONS[it], is) + 2 * sh, b[4] = {x1 - bw, cy - rh * 0.30f, bw, rh * 0.60f}; cv_button(cv, b, OVM_BUTTONS[it], 0, 0);
+        } else if (it == OVM_SHARPEN || it == OVM_FPSCAP) {   // segments, the current one filled: Off | Low | High; 30 | 40 | 45 | 60
+            const char *const *seg = it == OVM_SHARPEN ? OVM_SHARPS : OVM_FPSCAPS; int n = it == OVM_SHARPEN ? 3 : 4, cur = st >> (it == OVM_SHARPEN ? 20 : 22) & 3;
+            float segw = cv_text_w(seg[0], is) + sh, hh = rh * 0.62f, x0 = x1 - n * segw;
+            cv_rrect(cv, x0, cy - hh / 2, x1, cy + hh / 2, hh / 2, C_OFF);
+            cv_rrect(cv, x0 + cur * segw, cy - hh / 2, x0 + (cur + 1) * segw, cy + hh / 2, hh / 2, C_ACCENT);
+            for (int k = 0; k < n; k++) cv_text(cv, x0 + k * segw + (segw - cv_text_w(seg[k], is)) / 2, cy, seg[k], is, k == cur ? C_WHITE : C_DIM);
         } else if (it == OVM_MODE || it == OVM_PAD) {   // two segments, the current one filled: handheld (performance) | docked (resolution); by position | by label
             const char *const *seg = it == OVM_MODE ? OVM_MODES : OVM_PADS; int cur = it == OVM_MODE ? st >> 2 & 1 : st >> 28 & 1;
             float hh = rh * 0.46f, segw = fmaxf(cv_text_w(seg[0], is), cv_text_w(seg[1], is)) + sh, x0 = x1 - 2 * segw;
@@ -746,7 +759,8 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &ba};
         VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR}; VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
         VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &g_sfmt};
-        if (!V.has_dynrender && g_ov.rp) { ov_fb_drop(); vkDestroyRenderPass(V.dev, g_ov.rp, NULL); g_ov.rp = VK_NULL_HANDLE; }   // the pass follows the swapchain's format, as the pipeline does
+        // (the pass follows the swapchain's format by itself: ov_rp makes it again when g_sfmt changed, and swap_destroy dropped the framebuffers then. Dropping it here
+        // as well destroyed the pass and framebuffer the sharpening pass had just begun in this command buffer: a crash in vkEndCommandBuffer, DM_VK_SHARPEN on the OP)
         VkRenderPass orp = V.has_dynrender ? VK_NULL_HANDLE : ov_rp();
         if (!V.has_dynrender && !orp) { vkDestroyShaderModule(V.dev, vm, NULL); vkDestroyShaderModule(V.dev, fm, NULL); return 0; }
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, orp ? NULL : &rci, 0, 2, ss, &vi, &ia, NULL, &vs, &rs, &ms, NULL, &cbs, &dy, g_ov.layout, orp};
@@ -848,6 +862,80 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
     g_pace_target = t;
     return t - g_refresh_ns / 2;
 }
+// ---- Sharpening at present (DM_VK_SHARPEN=<0..100>, also the pause menu's Sharpen row, which sets it; 0 = off, the blit as before). The game's window image (Batman: Arkham
+// Knight's 1920x1080, already scaled up by the game from its 960x540 scene) is drawn into the picture's rectangle by a contrast-adaptive sharpening shader (shaders/sharpen.*)
+// in place of vkCmdBlitImage's linear filter; the overlay and the menu are drawn after it, unsharpened. Read again every 30 presents ----
+static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkSampler samp; VkPipeline pipe; VkFormat pfmt; VkImage img[4]; VkImageView view[4]; VkDescriptorSet set[4]; int next; } g_sh;
+static int sharpen_level(void) { static int v, n; if (n++ % 30 == 0) { const char *e = getenv("DM_VK_SHARPEN"); v = e ? atoi(e) : 0; v = v < 0 ? 0 : v > 100 ? 100 : v; } return v; }
+static int sharpen_ready(void) {
+    if (!g_sh.dsl) {
+        VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b}; VKCHK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_sh.dsl));
+        VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 24};
+        VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_sh.dsl, 1, &pr}; VKCHK(vkCreatePipelineLayout(V.dev, &pl, NULL, &g_sh.layout));
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4}; VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 4, 1, &ps};
+        VKCHK(vkCreateDescriptorPool(V.dev, &pi, NULL, &g_sh.pool));
+        for (int i = 0; i < 4; i++) { VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_sh.pool, 1, &g_sh.dsl}; VKCHK(vkAllocateDescriptorSets(V.dev, &ai, &g_sh.set[i])); }
+        VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+        VKCHK(vkCreateSampler(V.dev, &si, NULL, &g_sh.samp));
+    }
+    if (g_sh.pfmt == g_sfmt && g_sh.pipe) return 1;
+    if (g_sh.pipe) { vkDestroyPipeline(V.dev, g_sh.pipe, NULL); g_sh.pipe = VK_NULL_HANDLE; }
+    VkRenderPass orp = V.has_dynrender ? VK_NULL_HANDLE : ov_rp(); if (!V.has_dynrender && !orp) return 0;
+    VkShaderModule vm, fm;
+    VkShaderModuleCreateInfo vc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof sharpen_vert_spv, sharpen_vert_spv}; VKCHK(vkCreateShaderModule(V.dev, &vc, NULL, &vm));
+    VkShaderModuleCreateInfo fc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof sharpen_frag_spv, sharpen_frag_spv}; VKCHK(vkCreateShaderModule(V.dev, &fc, NULL, &fm));
+    VkPipelineShaderStageCreateInfo ss[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vm, "main", NULL},
+                                            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fm, "main", NULL}};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0};
+    VkPipelineViewportStateCreateInfo vs = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, 0, 0, VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0, 0, 0, 0, 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState ba = {0, 0, 0, 0, 0, 0, 0, 0xf};
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &ba};
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR}; VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
+    VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &g_sfmt};
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, orp ? NULL : &rci, 0, 2, ss, &vi, &ia, NULL, &vs, &rs, &ms, NULL, &cbs, &dy, g_sh.layout, orp};
+    VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &g_sh.pipe);
+    vkDestroyShaderModule(V.dev, vm, NULL); vkDestroyShaderModule(V.dev, fm, NULL);
+    if (r) { g_sh.pipe = VK_NULL_HANDLE; VKRED_ONCE(115, "sharpening pipeline failed: %d (the picture is blitted unsharpened)", r); return 0; }
+    g_sh.pfmt = g_sfmt; VKLOG("present: contrast-adaptive sharpening on (DM_VK_SHARPEN %d)", sharpen_level());
+    return 1;
+}
+static VkDescriptorSet sharpen_set(vkimg_t *im) {   // the window image's view and set (the game's window images: a few, kept)
+    for (int i = 0; i < 4; i++) if (g_sh.img[i] == im->img && g_sh.view[i]) return g_sh.set[i];
+    int i = g_sh.next++ % 4;
+    if (g_sh.view[i]) { vkDeviceWaitIdle(V.dev); vkDestroyImageView(V.dev, g_sh.view[i], NULL); g_sh.view[i] = VK_NULL_HANDLE; }   // (an image of a window made again: rare)
+    VkImageViewCreateInfo vc = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, im->img, VK_IMAGE_VIEW_TYPE_2D, im->fmt, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (vkCreateImageView(V.dev, &vc, NULL, &g_sh.view[i])) { g_sh.view[i] = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    g_sh.img[i] = im->img;
+    VkDescriptorImageInfo ii = {g_sh.samp, g_sh.view[i], VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_sh.set[i], 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii, NULL, NULL};
+    vkUpdateDescriptorSets(V.dev, 1, &w, 0, NULL);
+    return g_sh.set[i];
+}
+// draws the picture sharpened into tgt (TRANSFER_DST after its clear) → 1 (tgt is then COLOR_ATTACHMENT_OPTIMAL), or 0: blit it as before
+static int sharpen_draw(VkCommandBuffer cb, vkimg_t *im, VkImage tgt, VkImageView tview, uint32_t idx, int cx, int cy, int cw, int ch, int dx, int dy, int dw, int dh) {
+    int lvl = sharpen_level(); if (!lvl || im->samples > 1 || im->layers > 1) return 0;
+    if (!sharpen_ready()) return 0;
+    VkFramebuffer fb = V.has_dynrender ? VK_NULL_HANDLE : ov_fb(idx); if (!V.has_dynrender && !fb) return 0;
+    VkDescriptorSet set = sharpen_set(im); if (!set) return 0;
+    barrier(cb, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    if (V.has_dynrender) { VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, tview, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE};
+        VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, g_sext}, 1, 0, 1, &ca, NULL, NULL}; vkCmdBeginRendering(cb, &ri); }
+    else { VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, g_ov.rp, fb, {{0, 0}, g_sext}, 0, NULL}; vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE); }
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sh.pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sh.layout, 0, 1, &set, 0, NULL);
+    VkViewport vp = {(float)dx, (float)dy, (float)dw, (float)dh, 0, 1}; VkRect2D sc = {{dx < 0 ? 0 : dx, dy < 0 ? 0 : dy}, {(uint32_t)dw, (uint32_t)dh}};
+    vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
+    struct { float src[4], sharp, flip; } pc = {{(float)cx / im->w, (float)cy / im->h, (float)cw / im->w, (float)ch / im->h}, lvl / 100.0f, vk_window_bottom_up() ? 1.0f : 0.0f};
+    vkCmdPushConstants(cb, g_sh.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    if (V.has_dynrender) vkCmdEndRendering(cb); else vkCmdEndRenderPass(cb);
+    return 1;
+}
 static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t ticket) {   // period: the game's frame period (s); < 0 for a redraw (ticket 0)
     uint32_t k = g_pi++ % 8;
     vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
@@ -871,8 +959,9 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
     if (vk_window_bottom_up()) { b.srcOffsets[0].y = cy + ch; b.srcOffsets[1].y = cy; }   // lower-left origin: the window image is stored bottom-up (gfx_vk_exec.c)
     if (im->layout == VK_IMAGE_LAYOUT_UNDEFINED) { barrier(cb, im->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL); im->layout = VK_IMAGE_LAYOUT_GENERAL; }   // an imported frame buffer, first shown (gl_android.c)
-    vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     VkImageLayout lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    if (sharpen_draw(cb, im, tgt, tview, idx, cx, cy, cw, ch, dx, dy, dw, dh)) lay = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;   // (DM_VK_SHARPEN)
+    else vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     int external = dm_external_active();
     int ovm = external ? 0 : dm_overlay_visible(), menu = external ? -1 : dm_menu_state(), fps = dm_overlay_fps();
     if ((ovm || menu >= 0 || fps) && overlay_ready(cb, k, menu) && (V.has_dynrender || ov_fb(idx))) {   // without dynamic rendering, only with the image's framebuffer
@@ -1009,8 +1098,10 @@ static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, doub
 void dm_perf_frame(double period); void dm_perf_window(ANativeWindow *w, double fps); void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns);   // perf_android.c
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     vk_init();
-    { uint64_t vk_replay_ns(void); double vk_gpu_ms_recent(void);   // what else the frame costs: its replay and its GPU time
-      static uint64_t last_exec; uint64_t ex = vk_replay_ns(), rp = ex - last_exec; last_exec = ex; double g = vk_gpu_ms_recent(); int64_t gn = g > 0 ? (int64_t)(g * 1e6) : 0;
+    { uint64_t vk_replay_ns(void); double vk_gpu_ms_recent(void), vk_gpu_work_ms_recent(void);   // what else the frame costs: its replay and its GPU time
+      // DM_ADAPT_GPU=work (start-up): the GPU's own work (the parts' spans, gfx_vk_core.c g_tsp) and not the submission's span, which holds its waits for the replay
+      static int gwork = -1; if (gwork < 0) { const char *e = getenv("DM_ADAPT_GPU"); gwork = e && !strcmp(e, "work"); }
+      static uint64_t last_exec; uint64_t ex = vk_replay_ns(), rp = ex - last_exec; last_exec = ex; double g = gwork ? vk_gpu_work_ms_recent() : vk_gpu_ms_recent(); int64_t gn = g > 0 ? (int64_t)(g * 1e6) : 0;
       dm_perf_frame_cost((int64_t)rp, gn); }
     dm_perf_frame(period);   // paced to the game's frame period, and its work time reported to ADPF
     // A longer period goes to the window only once it has held for 60 presents; a shorter one at once. Super Mario Bros. Wonder's own controller (main+0xcfd24) asks
@@ -1026,6 +1117,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     vkimg_t *im = vk_tex(t);
     static uint64_t no_img, undrawn, shown;
     if (n == 600) { void crash_handlers_check(const char *when); crash_handlers_check("after 600 presents"); }
+    if (n % 300 == 0) { void vk_pass_report(void); vk_pass_report(); void vk_set_why_report(void); vk_set_why_report(); }   // (DM_VK_PASS_TIMES, DM_VK_SET_WHY: averages over 300 presents)
     if (n % 600 == 0) {
         extern struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatches, pipes_built, rt_kept, ns_exec, ns_desc, ns_pipe, max_pass_draws; } g_vkst; extern uint64_t g_ubd_landed, g_ubd_superseded, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_gpu_ns, g_pkg_n, g_pkg_bytes, g_pkg_ns, g_set_hits, g_set_new, g_ubd_racy, g_ns_set_build, g_ns_set_hash, g_ns_set_new, g_set_memo, g_set_memo_bad;
         static uint64_t psb, psh, psn, pe, pd, pp, ps, pb, pdr, pg, pkn, pkb, pkt, psm;
@@ -1040,7 +1132,6 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         { extern uint64_t g_order_kept, g_order_ended; static uint64_t pk, pn;   // gfx_vk_exec.c g_order_keep
           if (g_order_kept + g_order_ended > pk + pn) VKLOG("order-only barriers per frame (last 600): %.1f kept inside their pass, %.1f ended it", (g_order_kept - pk) / 600.0, (g_order_ended - pn) / 600.0);
           pk = g_order_kept; pn = g_order_ended; }
-        void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }
     if (!im) { no_img++; return present_enqueue(NULL, NULL, n, period); }

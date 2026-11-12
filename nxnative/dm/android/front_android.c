@@ -75,7 +75,24 @@ static char g_root[512];
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
+static _Atomic int g_set_sharpen = -1;   // the Sharpen row: 0 off, 1 low, 2 high (DM_VK_SHARPEN 0 / 40 / 80); -1: as env.txt says
+static void sharpen_apply(int v) { if (v >= 0) { char b[8]; snprintf(b, sizeof b, "%d", v == 2 ? 80 : v == 1 ? 40 : 0); setenv("DM_VK_SHARPEN", b, 1); } }
+static int sharpen_cur(void) { int c = atomic_load(&g_set_sharpen); if (c < 0) { const char *e = getenv("DM_VK_SHARPEN"); int n = e ? atoi(e) : 0; c = n >= 60 ? 2 : n > 0 ? 1 : 0; } return c; }
+// The FPS limit row (Picture tab): 0 the game's own rate (DM_FPS_CAP empty: the present interval it sets), 1-3 presents paced at 40 / 45 / 60 fps (hle_nvn.c fps_cap, read
+// again every 30 presents); -1: as env.txt says. An empty value and not unsetenv: the host reads the variable on another thread
+static const int FPSCAPS[4] = {0, 40, 45, 60};
+static _Atomic int g_set_fpscap = -1;
+static void fpscap_apply(int v) { if (v >= 0) { char b[8]; snprintf(b, sizeof b, v ? "%d" : "", FPSCAPS[v & 3]); setenv("DM_FPS_CAP", b, 1); } }
+static int fpscap_cur(void) { int c = atomic_load(&g_set_fpscap); if (c < 0) { const char *e = getenv("DM_FPS_CAP"); int n = e && *e ? atoi(e) : -1; c = n < 0 ? 0 : n == 0 || n >= 60 ? 3 : n >= 45 ? 2 : 1; } return c; }
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
+// Button maps per controller (the menu's Remap buttons, overlay_layout.h rm_*): settings.txt remap=<16 hex digits, the physical button of each Switch button> <controller>,
+// the controller named by vendor:product and its name (pad_watch reads them for each device id). A controller without one takes the Position / Label preset (pad_labels)
+enum { RM_MAX = 8 };
+static pthread_mutex_t g_rm_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { char key[80]; uint8_t m[RM_N]; } g_rm[RM_MAX]; static int g_nrm; static _Atomic int g_rm_ver;
+static struct { int id; char key[80]; } g_pid[16]; static int g_npid;   // device id → controller (under g_rm_mu)
+#define RM_NODEV (-1000)
+static _Atomic int g_map_dev = RM_NODEV;   // the device of the controller input being mapped (handle_event); RM_NODEV: no controller input yet
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1)
 static _Atomic int g_cust[2][2][DM_AOV_N][3], g_cust_ver, g_edit;
@@ -91,6 +108,12 @@ static void settings_load(void) {
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
         else if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_labels, v != 0);
+        else if (sscanf(line, "sharpen=%d", &v) == 1 && v >= 0 && v <= 2) { atomic_store(&g_set_sharpen, v); sharpen_apply(v); }
+        else if (sscanf(line, "fpscap=%d", &v) == 1 && v >= 0 && v <= 3) { atomic_store(&g_set_fpscap, v); fpscap_apply(v); }
+        else if (!strncmp(line, "remap=", 6) && g_nrm < RM_MAX) {   // remap=<16 hex digits> <controller>
+            char hex[RM_N + 1] = {0}, key[80] = {0}; int ok = sscanf(line + 6, "%16[0-9a-f] %79[^\n]", hex, key) == 2 && strlen(hex) == RM_N, seen = 0;
+            for (int i = 0; ok && i < RM_N; i++) { int d = hex[i] <= '9' ? hex[i] - '0' : hex[i] - 'a' + 10; g_rm[g_nrm].m[i] = (uint8_t)d; seen |= 1 << d; }
+            if (ok && seen == 0xffff) { snprintf(g_rm[g_nrm].key, sizeof g_rm[g_nrm].key, "%s", key); g_nrm++; } }   // (only a whole permutation)
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
             char lay[16], name[32]; int x, y, z, l, i;
             if (sscanf(line + 3, "%15[^,],%31[^,],%d,%d,%d", lay, name, &x, &y, &z) != 5 || (i = ctl_named(name)) < 0) continue;
@@ -108,7 +131,12 @@ static void settings_save(void) {
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
-    if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
+    if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));
+    if (atomic_load(&g_set_sharpen) >= 0) fprintf(f, "sharpen=%d\n", atomic_load(&g_set_sharpen));   // (only once the player chose: until then env.txt decides)
+    if (atomic_load(&g_set_fpscap) >= 0) fprintf(f, "fpscap=%d\n", atomic_load(&g_set_fpscap));
+    pthread_mutex_lock(&g_rm_mu);
+    for (int r = 0; r < g_nrm; r++) { char hex[RM_N + 1]; for (int i = 0; i < RM_N; i++) hex[i] = "0123456789abcdef"[g_rm[r].m[i] & 15]; hex[RM_N] = 0; fprintf(f, "remap=%s %s\n", hex, g_rm[r].key); }
+    pthread_mutex_unlock(&g_rm_mu);
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
         if ((x && y) || z) fprintf(f, "ui=%s,%s,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000);
@@ -217,29 +245,51 @@ static int pad_labels(void) {
     if (on < 0) { const char *e = getenv("DM_PAD_LABEL"); if (!e) e = getenv("DM_PAD_XBOX"); on = e && atoi(e) ? 1 : 0; }
     return on;
 }
-static uint64_t key_bit(int32_t k) {   // Nintendo layout by position: the bottom face button is B, the right one A (as the iOS front end maps)
-    if (pad_labels()) switch (k) {   // by label instead: A is A, B is B, X is X, Y is Y (the pause menu and the text entry follow it: A confirms, B erases)
-    case AKEYCODE_BUTTON_A: return DM_BTN_A; case AKEYCODE_BUTTON_B: return DM_BTN_B; case AKEYCODE_BUTTON_X: return DM_BTN_X; case AKEYCODE_BUTTON_Y: return DM_BTN_Y;
-    default: break;
-    }
+// the physical button (overlay_layout.h RM_PHYS_NAMES) of a key, -1 for the rest
+static int rm_phys_of_key(int32_t k) {
     switch (k) {
-    case AKEYCODE_BUTTON_A: return DM_BTN_B; case AKEYCODE_BUTTON_B: return DM_BTN_A; case AKEYCODE_BUTTON_X: return DM_BTN_Y; case AKEYCODE_BUTTON_Y: return DM_BTN_X;
-    case AKEYCODE_BUTTON_L1: return DM_BTN_L; case AKEYCODE_BUTTON_R1: return DM_BTN_R; case AKEYCODE_BUTTON_L2: return DM_BTN_ZL; case AKEYCODE_BUTTON_R2: return DM_BTN_ZR;
-    case AKEYCODE_BUTTON_THUMBL: return DM_BTN_LS; case AKEYCODE_BUTTON_THUMBR: return DM_BTN_RS; case AKEYCODE_BUTTON_START: return DM_BTN_PLUS; case AKEYCODE_BUTTON_SELECT: return DM_BTN_MINUS;
-    case AKEYCODE_DPAD_UP: return DM_BTN_UP; case AKEYCODE_DPAD_DOWN: return DM_BTN_DOWN; case AKEYCODE_DPAD_LEFT: return DM_BTN_LEFT; case AKEYCODE_DPAD_RIGHT: return DM_BTN_RIGHT;
-    default: return 0;
+    case AKEYCODE_BUTTON_A: return 0; case AKEYCODE_BUTTON_B: return 1; case AKEYCODE_BUTTON_X: return 2; case AKEYCODE_BUTTON_Y: return 3;
+    case AKEYCODE_BUTTON_L1: return 4; case AKEYCODE_BUTTON_R1: return 5; case AKEYCODE_BUTTON_L2: return 6; case AKEYCODE_BUTTON_R2: return 7;
+    case AKEYCODE_BUTTON_START: return 8; case AKEYCODE_BUTTON_SELECT: return 9; case AKEYCODE_BUTTON_THUMBL: return 10; case AKEYCODE_BUTTON_THUMBR: return 11;
+    case AKEYCODE_DPAD_UP: return 12; case AKEYCODE_DPAD_DOWN: return 13; case AKEYCODE_DPAD_LEFT: return 14; case AKEYCODE_DPAD_RIGHT: return 15;
+    default: return -1;
     }
+}
+// the controller of a device id ("" when pad_watch has not seen it yet)
+static void rm_key_of(int dev, char *out, size_t cap) {
+    out[0] = 0; if (dev == RM_NODEV) return;
+    pthread_mutex_lock(&g_rm_mu);
+    for (int i = 0; i < g_npid; i++) if (g_pid[i].id == dev) { snprintf(out, cap, "%s", g_pid[i].key); break; }
+    pthread_mutex_unlock(&g_rm_mu);
+    if (!out[0]) snprintf(out, cap, "0000:0000 unknown controller");   // a device pad_watch does not list (injected input, a device it has not seen yet)
+}
+// the map of the controller in use: its own, else the preset (Position, or Label: the Face buttons choice before remapping, DM_PAD_LABEL)
+static void rm_current(uint8_t m[RM_N]) {
+    static int cdev = -2, cver = -1, clab = -1; static uint8_t cm[RM_N];
+    int dev = atomic_load(&g_map_dev), ver = atomic_load(&g_rm_ver), lab = pad_labels();
+    if (dev != cdev || ver != cver || lab != clab) {
+        char key[80]; rm_key_of(dev, key, sizeof key); int found = 0;
+        pthread_mutex_lock(&g_rm_mu);
+        for (int r = 0; key[0] && r < g_nrm; r++) if (!strcmp(g_rm[r].key, key)) { memcpy(cm, g_rm[r].m, RM_N); found = 1; break; }
+        pthread_mutex_unlock(&g_rm_mu);
+        if (!found) rm_preset(cm, lab);
+        cdev = dev; cver = ver; clab = lab;
+    }
+    memcpy(m, cm, RM_N);
+}
+static uint64_t key_bit(int32_t k) {   // a controller's key → the Switch button its map gives it (the pause menu and the text entry follow it: A confirms, B erases)
+    int p = rm_phys_of_key(k); if (p < 0) return 0;
+    uint8_t m[RM_N]; rm_current(m); return rm_bit_of(m, p);
 }
 static int32_t axis(float v) { if (v > -0.12f && v < 0.12f) return 0; return (int32_t)(v * DM_STICK_MAX); }
 static uint64_t g_shake_btn;   // DM_BTN_SHAKE while the device is being shaken (below); input thread only
+static int pad_axis_phys(const float axes[8]) {   // the physical buttons the triggers and the hat press (bit = RM_PHYS_NAMES index)
+    return (axes[4] > 0.5f) << 6 | (axes[5] > 0.5f) << 7 | (axes[7] < -0.5f) << 12 | (axes[7] > 0.5f) << 13 | (axes[6] < -0.5f) << 14 | (axes[6] > 0.5f) << 15;
+}
 static uint64_t pad_axis_buttons(const float axes[8]) {
-    uint64_t b = 0;
-    if (axes[4] > 0.5f) b |= DM_BTN_ZL;
-    if (axes[5] > 0.5f) b |= DM_BTN_ZR;
-    if (axes[6] < -0.5f) b |= DM_BTN_LEFT;
-    if (axes[6] > 0.5f) b |= DM_BTN_RIGHT;
-    if (axes[7] < -0.5f) b |= DM_BTN_UP;
-    if (axes[7] > 0.5f) b |= DM_BTN_DOWN;
+    int ph = pad_axis_phys(axes); if (!ph) return 0;
+    uint8_t m[RM_N]; rm_current(m); uint64_t b = 0;
+    for (int p = 0; p < RM_N; p++) if (ph >> p & 1) b |= rm_bit_of(m, p);
     return b;
 }
 static void pad_publish(void) {
@@ -374,6 +424,9 @@ static void *pad_watch(void *a) {
                         jstring s = (*E)->CallObjectMethod(E, d, mName); const char *nm = !jx(E) && s ? (*E)->GetStringUTFChars(E, s, NULL) : NULL;
                         jint ven = (*E)->CallIntMethod(E, d, mVen), prod = (*E)->CallIntMethod(E, d, mProd); jx(E);
                         LOG("[input] controller attached: %s (device %d, sources 0x%x, %04x:%04x)", nm ? nm : "?", v[i], src, ven, prod);
+                        pthread_mutex_lock(&g_rm_mu); int slot = 0; while (slot < g_npid && g_pid[slot].id != v[i]) slot++;
+                        if (slot < 16) { g_pid[slot].id = v[i]; snprintf(g_pid[slot].key, sizeof g_pid[slot].key, "%04x:%04x %s", ven, prod, nm ? nm : "?"); if (slot == g_npid) g_npid++; }
+                        pthread_mutex_unlock(&g_rm_mu); atomic_fetch_add(&g_rm_ver, 1);
                         if (nm) (*E)->ReleaseStringUTFChars(E, s, nm);
                         if (s) (*E)->DeleteLocalRef(E, s);
                     }
@@ -451,6 +504,7 @@ static int g_menu_ptr = -1, g_menu_row = -2;   // the pointer pressing in the me
 static _Atomic int g_tx_ver;   // the text entry's edit count: the panel is drawn again when it changes
 static _Atomic int g_ed_st;    // the layout editor's state for dm_menu_state (overlay_layout.h OVE_ST)
 static _Atomic int g_sp_on, g_sp_hi = -1, g_sp_ver;   // the save picker (below): open, its highlighted row, its edit count
+static _Atomic int g_exit_ask;   // Exit game chosen once (menu_exit)
 static _Atomic int g_sv_st, g_sv_n;                   // Export save: its outcome (overlay_layout.h OVX_*), the exports made
 int dm_menu_state(void) {
     if (atomic_load(&g_tx_on)) return 1 << 16 | (atomic_load(&g_tx_ver) & 0xffff);   // the text entry's panel (gfx_vk_present.c ov_text_panel)
@@ -458,12 +512,12 @@ int dm_menu_state(void) {
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
     return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
-           atomic_load(&g_menu_tab) << 8 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 | pad_labels() << 28;
+           (atomic_load(&g_menu_tab) & 1) << 8 | (atomic_load(&g_menu_tab) >> 1 & 1) << 30 | atomic_load(&g_set_opacity) << 9 | (atomic_load(&g_menu_tab) == 2 ? sharpen_cur() | fpscap_cur() << 2 : atomic_load(&g_sv_st)) << 20 | (atomic_load(&g_sv_n) & 15) << 24 | pad_labels() << 28 | atomic_load(&g_exit_ask) << 29;
 }
 int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_menu); }   // gfx_vk_present.c draws the counter (not while the menu holds the game)
 static void menu_open(int hi) {
     if (!atomic_load(&g_running) || atomic_exchange(&g_menu, 1)) return;
-    atomic_store(&g_menu_hi, hi); g_menu_ptr = -1;
+    atomic_store(&g_menu_hi, hi); g_menu_ptr = -1; atomic_store(&g_exit_ask, 0);
     if (atomic_load(&g_sv_st) != OVX_BUSY) atomic_store(&g_sv_st, OVX_IDLE);   // the last export's note goes (one still copying stays)
     dm_input_set(0, 0, 0, 0, 0); dm_touch_set(NULL, 0); atomic_store(&g_touch_btn, 0);   // nothing stays pressed in the game
     for (int i = 0; i < 16; i++) atomic_store(&g_press_t[i], 0);
@@ -479,7 +533,7 @@ static void menu_close(void) {
     if (atomic_load(&g_edit)) { ed_cancel(); return; }   // the editor first: its changes are kept or thrown away before the game goes on
     if (atomic_load(&g_sp_on)) { sp_back(); return; }    // the save picker: back a step
     if (!atomic_exchange(&g_menu, 0)) return;
-    g_menu_ptr = -1; atomic_store(&g_menu_t, 0);
+    g_menu_ptr = -1; atomic_store(&g_menu_t, 0); atomic_store(&g_exit_ask, 0);
     hold_sync(); dm_haptics_suspend(4, 0); dm_overlay_redraw();
     LOG("[menu] closed: the game goes on (gamepad %s, opacity %d%%, rumble %s, face buttons by %s, frame rate %s, %s)", atomic_load(&g_set_overlay) ? "on" : "off", atomic_load(&g_set_opacity),
         atomic_load(&g_set_rumble) ? "on" : "off", pad_labels() ? "label" : "position", atomic_load(&g_set_fps) ? "shown" : "hidden", dm_opmode() ? "docked" : "handheld");
@@ -489,18 +543,35 @@ static void menu_opacity(int v) {   // the slider: a new value is drawn at once 
     if (atomic_exchange(&g_set_opacity, v) != v) { dm_haptics_android_tap(); dm_overlay_redraw(); }
 }
 static void menu_tab(int t) { t = (t % OVM_TABS + OVM_TABS) % OVM_TABS; if (atomic_exchange(&g_menu_tab, t) != t) dm_haptics_android_tap(); dm_overlay_redraw(); }
-static void ed_open(void); static void sp_open(void); static void save_export(void);
+static void ed_open(void); static void sp_open(void); static void save_export(void); static void rm_open(void);
+// Exit game (the Game tab's last row): chosen once it asks again (its row reads "Exit game: press again", dm_menu_state bit 29); chosen again, the app ends as the save
+// manager's requests end it: Activity.finish() (Android goes back to the app or launcher before it), then _exit(0) from on_destroy, or from a thread 2 s later should the
+// activity not go. The game is paused in the menu; a save it commits is swapped in whole (fs's transactional save), so an end in the middle of one keeps the last
+static void *exit_later(void *a) { (void)a; sleep(2); LOG("[menu] Exit game: the activity did not end, the app ends itself"); _exit(0); }
+static void menu_exit(void) {
+    LOG("[menu] Exit game: the app ends");
+    pthread_t t; if (pthread_create(&t, NULL, exit_later, NULL)) _exit(0); pthread_detach(t);
+    JavaVM *vm = g_act ? g_act->vm : NULL; JNIEnv *E;
+    if (!vm || (*vm)->AttachCurrentThread(vm, &E, NULL) != JNI_OK) { _exit(0); }
+    jclass c = (*E)->GetObjectClass(E, g_act->clazz); jmethodID m = c ? (*E)->GetMethodID(E, c, "finish", "()V") : NULL;
+    if (m) (*E)->CallVoidMethod(E, g_act->clazz, m);
+    if (!m || (*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); _exit(0); }
+}
 static void menu_do(int item) {
+    if (item != OVM_EXIT && atomic_exchange(&g_exit_ask, 0)) dm_overlay_redraw();   // another row: the question goes
     if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, !atomic_load(&g_set_overlay)); atomic_store(&g_overlay, 1); settings_save(); }
     else if (item == OVM_RUMBLE) { int on = !atomic_load(&g_set_rumble); atomic_store(&g_set_rumble, on); dm_haptics_android_set(on); settings_save(); }
     else if (item == OVM_FPS) { atomic_store(&g_set_fps, !atomic_load(&g_set_fps)); settings_save(); }
     else if (item == OVM_MODE) { dm_set_opmode(dm_opmode() ? 0 : 1); settings_save(); }   // the game takes it when it goes on
-    else if (item == OVM_PAD) { atomic_store(&g_set_labels, !pad_labels()); settings_save(); }   // at once (pad_labels)
+    else if (item == OVM_PAD) { dm_haptics_android_tap(); rm_open(); return; }   // Remap buttons (rm_*)
+    else if (item == OVM_SHARPEN) { int c = (sharpen_cur() + 1) % 3; atomic_store(&g_set_sharpen, c); sharpen_apply(c); settings_save(); }   // at the next presents (gfx_vk_present.c sharpen_level)
+    else if (item == OVM_FPSCAP) { int c = (fpscap_cur() + 1) % 4; atomic_store(&g_set_fpscap, c); fpscap_apply(c); settings_save(); }
     else if (item == OVM_TAB) { menu_tab(atomic_load(&g_menu_tab) + 1); return; }
     else if (item == OVM_EDIT) { dm_haptics_android_tap(); ed_open(); return; }
     else if (item == OVM_OPACITY) return;   // (the slider is dragged, or stepped with left and right)
     else if (item == OVM_EXPORT) { if (atomic_load(&g_sv_st) == OVX_BUSY) return; save_export(); }
     else if (item == OVM_IMPORT) { dm_haptics_android_tap(); sp_open(); return; }
+    else if (item == OVM_EXIT) { dm_haptics_android_tap(); if (!atomic_exchange(&g_exit_ask, 1)) { dm_overlay_redraw(); return; } menu_exit(); return; }
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
     if (item == OVM_RESUME) menu_close(); else dm_overlay_redraw();
 }
@@ -556,7 +627,7 @@ static void menu_key(uint64_t bit) {   // a controller key pressed while the men
 #define SP_MAX 64
 #define SP_PER (OVM_ROWS - 2)
 static pthread_mutex_t g_sp_mu = PTHREAD_MUTEX_INITIALIZER;   // the picker's list and the export's note
-static struct { int n, page, confirm, closing, ptr, row; dm_save_entry e[SP_MAX], pick; } g_sp = {.ptr = -1};
+static struct { int n, page, confirm, closing, ptr, row, mode; dm_save_entry e[SP_MAX], pick; } g_sp = {.ptr = -1};   // mode 1: the button remapping (rm_*) in the same panel
 static char g_sv_note[96];
 int dm_save_note(char *out, int cap) { pthread_mutex_lock(&g_sp_mu); snprintf(out, (size_t)cap, "%s", g_sv_note); pthread_mutex_unlock(&g_sp_mu); return atomic_load(&g_sv_st); }
 static void *export_run(void *a) {
@@ -573,12 +644,12 @@ static void sp_changed(void) { atomic_fetch_add(&g_sp_ver, 1); dm_overlay_redraw
 static int sp_on_page(void) { int k = g_sp.n - g_sp.page * SP_PER; return k < 0 ? 0 : k > SP_PER ? SP_PER : k; }   // the caller holds g_sp_mu
 static int sp_selectable(int row) {   // the rows a controller and a finger can choose
     pthread_mutex_lock(&g_sp_mu);
-    int ok = g_sp.closing ? 0 : g_sp.confirm ? row == OVM_ROWS - 2 || row == OVM_ROWS - 1 : (row >= 1 && row <= sp_on_page()) || row == OVM_ROWS - 1;
+    int ok = g_sp.closing ? 0 : g_sp.confirm ? row == OVM_ROWS - 2 || row == OVM_ROWS - 1 : (row >= 1 && row <= sp_on_page() && (g_sp.mode != 1 || atomic_load(&g_map_dev) != RM_NODEV)) || row == OVM_ROWS - 1;
     pthread_mutex_unlock(&g_sp_mu); return ok;
 }
 static void sp_open(void) {
     pthread_mutex_lock(&g_sp_mu);
-    int n = g_sp.n = dm_saves_list(g_sp.e, SP_MAX); g_sp.page = g_sp.confirm = g_sp.closing = 0; g_sp.ptr = -1;
+    int n = g_sp.n = dm_saves_list(g_sp.e, SP_MAX); g_sp.page = g_sp.confirm = g_sp.closing = g_sp.mode = 0; g_sp.ptr = -1;
     pthread_mutex_unlock(&g_sp_mu);
     atomic_store(&g_sp_hi, n ? 1 : OVM_ROWS - 1); atomic_store(&g_sp_on, 1); sp_changed();
     LOG("[saves] picker opened: %d saves in %s", n, dm_saves_dir());
@@ -593,11 +664,41 @@ static void sp_back(void) {   // the confirmation → the list → the menu (not
 static void *sp_end(void *a) {   // the panel's note shows for a moment, then the app ends; the next start imports the save (saves_android.c dm_saves_start)
     (void)a; sleep(3); LOG("[saves] the app ends for the import"); _exit(0);
 }
+// ---- Remap buttons (the menu's Gamepad tab): the save picker's panel with a row for each Switch button and the controller's button on it, then Reset: Position and
+// Reset: Label. A row chosen waits for the next button of the controller in use (a key, a trigger or the hat) and gives it to that Switch button; the Switch button that
+// had it takes the row's old one (overlay_layout.h rm_assign). Nothing within 5 s cancels (every button can be the answer). Kept per controller in settings.txt ----
+static _Atomic int g_rm_listen = -1, g_rm_tok;
+static void rm_store(const uint8_t m[RM_N]) {   // the map of the controller in use, kept
+    char key[80]; rm_key_of(atomic_load(&g_map_dev), key, sizeof key); if (!key[0]) return;
+    pthread_mutex_lock(&g_rm_mu);
+    int r = 0; while (r < g_nrm && strcmp(g_rm[r].key, key)) r++;
+    if (r == g_nrm) { if (g_nrm == RM_MAX) { memmove(&g_rm[0], &g_rm[1], sizeof g_rm[0] * (RM_MAX - 1)); r = RM_MAX - 1; } else g_nrm++; snprintf(g_rm[r].key, sizeof g_rm[r].key, "%s", key); }
+    memcpy(g_rm[r].m, m, RM_N);
+    pthread_mutex_unlock(&g_rm_mu);
+    atomic_fetch_add(&g_rm_ver, 1); settings_save();
+    LOG("[input] buttons of %s: %s", key, rm_is_preset(m, 0) ? "position" : rm_is_preset(m, 1) ? "label" : "custom");
+}
+static void rm_open(void) {
+    pthread_mutex_lock(&g_sp_mu); g_sp.n = RM_N + 2; g_sp.page = g_sp.confirm = g_sp.closing = 0; g_sp.ptr = -1; g_sp.mode = 1; pthread_mutex_unlock(&g_sp_mu);
+    atomic_store(&g_rm_listen, -1); atomic_store(&g_sp_hi, atomic_load(&g_map_dev) != RM_NODEV ? 1 : OVM_ROWS - 1); atomic_store(&g_sp_on, 1); sp_changed();
+    LOG("[input] Remap buttons opened");
+}
+static void *rm_timeout(void *a) { int tok = (int)(intptr_t)a; sleep(5); if (atomic_load(&g_rm_tok) == tok && atomic_exchange(&g_rm_listen, -1) >= 0) sp_changed(); return NULL; }
+static int rm_capture(int phys) {   // the button pressed while a row waits: 1 when it was taken
+    int sw = atomic_exchange(&g_rm_listen, -1); if (sw < 0 || phys < 0) return 0;
+    uint8_t m[RM_N]; rm_current(m); rm_assign(m, sw, phys); rm_store(m);
+    dm_haptics_android_tap(); sp_changed(); return 1;
+}
+static void rm_do(int item) {   // a row of the remapping (the caller holds no lock)
+    if (item < RM_N) { atomic_store(&g_rm_listen, item); pthread_t t; if (!pthread_create(&t, NULL, rm_timeout, (void *)(intptr_t)atomic_fetch_add(&g_rm_tok, 1) + 1)) pthread_detach(t); sp_changed(); return; }
+    uint8_t m[RM_N]; rm_preset(m, item == RM_N + 1); rm_store(m); sp_changed();
+}
 static void sp_do(int row) {
     if (!sp_selectable(row)) return;
     dm_haptics_android_tap();
-    if (row == OVM_ROWS - 1) { sp_back(); return; }
+    if (row == OVM_ROWS - 1) { atomic_store(&g_rm_listen, -1); sp_back(); return; }
     pthread_mutex_lock(&g_sp_mu);
+    if (g_sp.mode == 1) { int item = g_sp.page * SP_PER + row - 1; pthread_mutex_unlock(&g_sp_mu); rm_do(item); return; }
     if (!g_sp.confirm) { g_sp.pick = g_sp.e[g_sp.page * SP_PER + row - 1]; g_sp.confirm = 1; pthread_mutex_unlock(&g_sp_mu); atomic_store(&g_sp_hi, OVM_ROWS - 2); sp_changed(); return; }
     char name[64]; snprintf(name, sizeof name, "%s", g_sp.pick.name);
     pthread_mutex_unlock(&g_sp_mu);
@@ -646,7 +747,16 @@ int dm_save_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_save_panel)
     if (!atomic_load(&g_sp_on)) return 0;
     memset(rows, 0, sizeof(ov_srow) * OVM_ROWS);
     pthread_mutex_lock(&g_sp_mu);
-    if (g_sp.closing) {
+    if (g_sp.mode == 1) {
+        int pages = (g_sp.n + SP_PER - 1) / SP_PER, k = sp_on_page(), lis = atomic_load(&g_rm_listen); uint8_t m[RM_N]; rm_current(m);
+        char key[80]; rm_key_of(atomic_load(&g_map_dev), key, sizeof key); const char *nm = strchr(key, ' ');
+        SP_ROW(0, OVS_TITLE, "Remap buttons"); snprintf(rows[0].right, sizeof rows[0].right, "%.24s%s%d/%d", nm ? nm + 1 : "", nm ? "  " : "", g_sp.page + 1, pages);
+        if (atomic_load(&g_map_dev) == RM_NODEV) { SP_ROW(1, OVS_NOTE, "Press a button on the controller"); SP_ROW(2, OVS_NOTE, "to remap, then choose a row."); }
+        else for (int j = 0; j < k; j++) { int it = g_sp.page * SP_PER + j;
+            if (it < RM_N) { SP_ROW(1 + j, OVS_ITEM, "%s", RM_SW_NAMES[it]); snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "%s", lis == it ? "Press a button..." : RM_PHYS_NAMES[m[it]]); }
+            else SP_ROW(1 + j, OVS_ITEM, "%s", it == RM_N ? "Reset: Position" : "Reset: Label"); }
+        SP_ROW(OVM_ROWS - 1, OVS_BACK, "Back");
+    } else if (g_sp.closing) {
         SP_ROW(0, OVS_TITLE, "Importing the save"); SP_ROW(1, OVS_ITEM, "%s", g_sp.pick.name); sp_size(rows[1].right, sizeof rows[1].right, &g_sp.pick);
         SP_ROW(2, OVS_NOTE, "The game closes now. Open it again:"); SP_ROW(3, OVS_NOTE, "the save is imported as it starts.");
     } else if (g_sp.confirm) {
@@ -948,6 +1058,8 @@ static int handle_event(AInputEvent *e) {
             if (down && AKeyEvent_getRepeatCount(e) == 0) { if (atomic_load(&g_menu)) menu_close(); else menu_open(k == AKEYCODE_BACK ? -1 : 0); }
             return 1;
         }
+        if ((src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) atomic_store(&g_map_dev, AInputEvent_getDeviceId(e));
+        if (atomic_load(&g_rm_listen) >= 0 && atomic_load(&g_sp_on) && down && AKeyEvent_getRepeatCount(e) == 0 && rm_capture(rm_phys_of_key(k))) return 1;   // Remap buttons waits for a button
         uint64_t bit = key_bit(k);
         if (!bit) {   // the rest: the system's. A controller's key nothing maps is logged once, so a new controller's menu key can be found
             static uint8_t seen[64];
@@ -987,6 +1099,8 @@ static int handle_event(AInputEvent *e) {
             pad_mark_used(AInputEvent_getDeviceId(e));
         if (atomic_load(&g_menu)) {   // the hat moves the selection
             static float hx, hy; float x = axes[6], y = axes[7];
+            if (atomic_load(&g_rm_listen) >= 0 && atomic_load(&g_sp_on)) { int ph = pad_axis_phys(axes); atomic_store(&g_map_dev, AInputEvent_getDeviceId(e));   // Remap buttons: a trigger or the hat
+                if (ph) { hx = x; hy = y; rm_capture(__builtin_ctz((unsigned)ph)); return 1; } }
             if (y < -0.5f && hy >= -0.5f) menu_key(DM_BTN_UP); else if (y > 0.5f && hy <= 0.5f) menu_key(DM_BTN_DOWN);
             if (x < -0.5f && hx >= -0.5f) menu_key(DM_BTN_LEFT); else if (x > 0.5f && hx <= 0.5f) menu_key(DM_BTN_RIGHT);
             hx = x; hy = y; return 1;

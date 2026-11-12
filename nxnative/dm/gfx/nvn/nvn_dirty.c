@@ -22,6 +22,11 @@
 // untagged address matched no range, and the first write into a protected pool page (the command buffer's own memory, a semaphore release) crashed the app. No-op on a Mac
 #define UA(p) ((uintptr_t)(p) & 0x00ffffffffffffffull)
 enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2 };
+enum { DEFRAG_MP = 4000, DEFRAG_QUIET_MS = 1000 };   // (nvn_dirty_defrag below)
+// Faults by the kind of protection they hit: 0 a packaged texture's (after its upload), 1 a registration's (hle_nvn.c ft_add, tex_dirty_upload). The kind rides in the span's
+// top bit (nvn_dirty_protect_kind); nvn_dirty_fault_kinds reads the counts
+static _Atomic uint64_t g_fault_kind[2]; static __thread int g_protect_kind;
+void nvn_dirty_fault_kinds(uint64_t *pkg, uint64_t *reg) { *pkg = atomic_load(&g_fault_kind[0]); *reg = atomic_load(&g_fault_kind[1]); }
 enum { BUSY_WAIT_MS = 2000 };
 // Tracked ranges = the memory pools (registered by MemoryPoolInitialize). After a pool is destroyed its live=0 slot is reused; the signal handler scans without locks.
 // The table grows in blocks of 1,024 slots, up to 262,144; a block is never moved or freed, so the signal handler reads it without locks. A pool past the end goes untracked: its textures count
@@ -83,9 +88,20 @@ static range_t *find_span(uintptr_t a, size_t len) {
     for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a + len <= r->end) return r; }
     return NULL;
 }
+// The rescue when making a page writable fails (the process at the kernel's mapping limit: the change would split a mapping): the whole range made writable in one call,
+// which splits nothing where the range is a mapping of its own (a zero-copy pool), and every protected page of it stamped as written (its textures are uploaded again).
+// The caller holds page `held` BUSY (or none: ~0). Signal-safe: one mprotect and atomics. 0 = done (the range is writable), else the mapping limit holds it too
+static _Atomic uint64_t g_mp_rescue;
+static int range_writable(range_t *r, uintptr_t held) {
+    if (mprotect((void *)r->base, r->end - r->base, PROT_READ | PROT_WRITE)) return -1;
+    atomic_fetch_add(&g_mp_rescue, 1); atomic_store(&r->nmp, DEFRAG_MP);   // (its mappings get defragmented at the next sweep)
+    size_t np = (r->end - r->base) >> g_shift;
+    for (size_t k = 0; k < np; k++) { uint8_t st = PG_PROT; if (k == held || atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) { stamp_page(r, k); atomic_store(&r->state[k], PG_NONE); } }
+    return 0;
+}
 static int unprotect_page(range_t *r, uintptr_t p) {   // The caller has already changed the state from PROT to BUSY. 0 = unprotected; else it stays protected
     atomic_fetch_add(&r->nmp, 1);
-    if (mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE)) { atomic_store(&r->state[p], PG_PROT); return -1; }
+    if (mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE) && range_writable(r, p)) { atomic_store(&r->state[p], PG_PROT); return -1; }
     stamp_page(r, p);
     atomic_store(&r->state[p], PG_NONE);
     return 0;
@@ -108,13 +124,14 @@ static int on_fault(void *addr, int is_write, void *uc) {
     uintptr_t a = UA(addr); int ours = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++) {   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         range_t *r = rg(i); if (!live_at(i) || a < r->base || a >= r->end) continue;
-        uintptr_t pg = (a - r->base) >> g_shift; uint32_t sp = atomic_load(&r->span[pg]);
+        uintptr_t pg = (a - r->base) >> g_shift; uint32_t spk = atomic_load(&r->span[pg]), sp = spk & 0x7fffffffu;
+        atomic_fetch_add(&g_fault_kind[spk >> 31 & 1], 1);   // whose protection: a packaged texture's upload (0) or a registration (1, tex_dirty_upload)
         ours |= release_page(r, pg, &g_faults);
         // The rest of the storage the same protect call covered goes with it: the texture is uploaded again after any write into it, so this costs no upload, and the
         // game's writes into it fault once instead of once a page. Released a page at a time, a texture written at every other page left its storage in alternating
         // read-only and writable pages, each a mapping of its own: Xenoblade Chronicles 3 reached the kernel's mapping limit (65,530) in its first battle, after which
         // mprotect failed, a faulting write was never let through, and the game hung (or an UnmapPhysicalMemory failed with ENOMEM)
-        if (sp) { uintptr_t q = sp - 1; while (q < r->cap && q < ((r->end - r->base) >> g_shift) && atomic_load(&r->span[q]) == sp) q++; if (q > sp - 1) release_pages(r, sp - 1, q - 1, &g_faults); }
+        if (sp) { uintptr_t q = sp - 1; while (q < r->cap && q < ((r->end - r->base) >> g_shift) && atomic_load(&r->span[q]) == spk) q++; if (q > sp - 1) release_pages(r, sp - 1, q - 1, &g_faults); }
     }
     return ours;
 }
@@ -128,6 +145,10 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         if (open) {
             atomic_fetch_add(&r->nmp, 1);
             if (mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ | PROT_WRITE)) {
+                // The whole range writable instead (range_writable; the run's pages are BUSY: made NONE with it)
+                int ok = !mprotect((void *)r->base, r->end - r->base, PROT_READ | PROT_WRITE);
+                if (ok) { atomic_fetch_add(&g_mp_rescue, 1); atomic_store(&r->nmp, DEFRAG_MP); for (uintptr_t k = run; k < i; k++) { stamp_page(r, k); atomic_store(&r->state[k], PG_NONE); }
+                    range_writable(r, ~(uintptr_t)0); if (count) atomic_fetch_add(count, i - run); open = 0; if (i <= q && st == PG_BUSY) release_page(r, i, count); continue; }
                 // A failed mprotect may change only part of the run; neither writable states nor a retry are safe. Also called from the fault handler.
                 static const char msg[] = "[dm] [RED] dirty-page tracking: cannot make guest memory writable; stopping\n";
                 (void)write(STDERR_FILENO, msg, sizeof msg - 1); _exit(1);
@@ -164,12 +185,15 @@ uint64_t nvn_dirty_released(void) { return atomic_load(&g_released); }
 // runs. Run on the thread that protects textures (the replay's); remap() returns 0 when it mapped the range.
 // A range the host prepared a write into in the last DEFRAG_QUIET_MS is left for later: the host's own writes (a file read into a pool, which the game does for its
 // streaming) are system calls the kernel fails with EFAULT on a page made read-only under them; Xenoblade Chronicles 3 then inflated a short read and crashed in zlib
-enum { DEFRAG_MP = 4000, DEFRAG_QUIET_MS = 1000 };
-int nvn_dirty_defrag(int (*remap)(void *mem, size_t len)) {
-    int done = 0, n = atomic_load(&g_nr);
+// min_mp: the mprotect calls since the last time that make a range worth it (DEFRAG_MP; lower when the process nears the kernel's mapping limit, gfx_vk_tex.c vk_tex_sweep)
+static int g_df_mid, g_df_quiet, g_df_fail;   // the last call's ranges left: starting mid-page, written by the host just before, refused by remap()
+void nvn_dirty_defrag_why(int *mid, int *quiet, int *fail) { *mid = g_df_mid; *quiet = g_df_quiet; *fail = g_df_fail; }
+int nvn_dirty_defrag_min(int (*remap)(void *mem, size_t len), uint32_t min_mp) {
+    int done = 0, n = atomic_load(&g_nr); g_df_mid = g_df_quiet = g_df_fail = 0;
     for (int i = 0; i < n; i++) {
-        range_t *r = rg(i); if (!live_at(i) || atomic_load(&r->nmp) < DEFRAG_MP || r->mem != r->base) continue;   // a pool starting mid-page shares that page: left alone
-        if ((mach_absolute_time() - atomic_load(&r->prep)) * g_tb.numer / g_tb.denom < (uint64_t)DEFRAG_QUIET_MS * 1000000ull) continue;
+        range_t *r = rg(i); if (!live_at(i) || atomic_load(&r->nmp) < min_mp) continue;
+        if (r->mem != r->base) { g_df_mid++; continue; }   // a pool starting mid-page shares that page: left alone
+        if ((mach_absolute_time() - atomic_load(&r->prep)) * g_tb.numer / g_tb.denom < (uint64_t)DEFRAG_QUIET_MS * 1000000ull) { g_df_quiet++; continue; }
         size_t np = (r->end - r->base) >> g_shift;
         uint8_t *was = malloc(np); if (!was) continue;
         for (size_t p = 0; p < np; p++) {   // every page BUSY; was = its state before
@@ -188,10 +212,12 @@ int nvn_dirty_defrag(int (*remap)(void *mem, size_t len)) {
             stamp_page(r, p); atomic_store(&r->state[p], PG_NONE);
         }
         free(was);
-        if (ok) { atomic_store(&r->nmp, 0); done++; }
+        if (ok) { atomic_store(&r->nmp, 0); done++; } else g_df_fail++;
     }
     return done;
 }
+int nvn_dirty_defrag(int (*remap)(void *mem, size_t len)) { return nvn_dirty_defrag_min(remap, DEFRAG_MP); }
+uint64_t nvn_dirty_rescues(void) { return atomic_load(&g_mp_rescue); }   // mprotect calls that failed and were rescued (range_writable) or left pages unprotected
 // Runs of protected pages over every live range: each is a mapping of its own (at most two with the writable pieces around it)
 int nvn_dirty_runs(void) {
     int n = atomic_load(&g_nr), runs = 0;
@@ -256,7 +282,10 @@ int nvn_dirty_tracked(const void *addr, size_t len) {
 // The tracked range holding [addr, addr+len), as a handle a caller keeps (packaged textures: the scan over every range ran twice per texture lookup). NULL = untracked
 const void *nvn_dirty_span(const void *addr, size_t len) { return len ? find_span(UA(addr), len) : NULL; }
 // Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
-void nvn_dirty_protect(const void *addr, size_t len) {
+void nvn_dirty_protect_kind(const void *addr, size_t len, int kind);
+void nvn_dirty_protect(const void *addr, size_t len) { nvn_dirty_protect_kind(addr, len, 0); }
+void nvn_dirty_protect_kind(const void *addr, size_t len, int kind) {
+    g_protect_kind = kind;
     range_t *r = len ? find_span(UA(addr), len) : NULL;
     if (!r) return;
     uintptr_t a = UA(addr), p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
@@ -267,7 +296,10 @@ void nvn_dirty_protect(const void *addr, size_t len) {
         uint8_t st = PG_NONE;
         int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
         if (took && !open) { run = i; open = 1; }
-        if (!took && open) { atomic_fetch_add(&r->nmp, 1); mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) { atomic_store(&r->span[k], (uint32_t)p + 1); atomic_store(&r->state[k], PG_PROT); } open = 0; }
+        if (!took && open) { atomic_fetch_add(&r->nmp, 1);
+            if (mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ)) { atomic_fetch_add(&g_mp_rescue, 1); for (uintptr_t k = run; k < i; k++) { stamp_page(r, k); atomic_store(&r->state[k], PG_NONE); } }   // not protected: writable and written (uploaded again)
+            else for (uintptr_t k = run; k < i; k++) { atomic_store(&r->span[k], ((uint32_t)p + 1) | (g_protect_kind ? 0x80000000u : 0)); atomic_store(&r->state[k], PG_PROT); }
+            open = 0; }
     }
 }
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }

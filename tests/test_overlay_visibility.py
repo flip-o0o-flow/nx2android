@@ -31,7 +31,15 @@ class OverlayVisibility(unittest.TestCase):
 #include "front.h"
 #include "overlay_layout.h"
 static _Atomic int g_set_overlay, g_overlay, g_pads, g_edit;
-static _Atomic int g_set_rumble, g_set_fps, g_set_labels, g_menu_tab, g_sv_st;
+static _Atomic int g_set_rumble, g_set_fps, g_menu_tab, g_sv_st;
+#define RM_NODEV (-1000)
+static _Atomic int g_map_dev = RM_NODEV, g_rm_listen = -1;   // Remap buttons (off)
+static void rm_current(uint8_t m[RM_N]) { rm_preset(m, 0); }
+static int rm_phys_of_key(int k) { (void)k; return -1; }
+static int rm_capture(int phys) { (void)phys; return 0; }
+static void rm_open(void) {}
+static _Atomic int g_set_sharpen = -1; static void sharpen_apply(int v) { (void)v; } static int sharpen_cur(void) { return 0; }   // the Sharpen row (off)
+static _Atomic int g_set_fpscap = -1; static void fpscap_apply(int v) { (void)v; } static int fpscap_cur(void) { return 0; }   // the FPS limit row (the game's rate)
 static int layout, saves;
 int dm_overlay_layout(void) { return layout; }
 float dm_overlay_scale(void) { return 1; }
@@ -43,11 +51,12 @@ static void dm_haptics_android_set(int on) { (void)on; }
 static void dm_haptics_android_tap(void) {}
 static int dm_opmode(void) { return 0; }
 static void dm_set_opmode(int mode) { (void)mode; }
-static int pad_labels(void) { return 0; }
 static void menu_tab(int tab) { (void)tab; }
 static void ed_open(void) {}
 static void sp_open(void) {}
 static void save_export(void) {}
+static _Atomic int g_exit_ask;
+static void menu_exit(void) {}
 static void menu_close(void) {}
 static void dm_overlay_redraw(void) {}
 ''' + visible + hit + menu + r'''

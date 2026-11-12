@@ -64,6 +64,16 @@ int main(void) {
         assert(!ov_face_combo(phone_layout, x[0], x[1], 2400, 1080));
     }
     custom_faces = 0;
+    {   // button remapping: presets, a swap on a button in use, always a permutation
+        uint8_t m[RM_N]; rm_preset(m, 0);
+        assert(rm_bit_of(m, 1) == DM_BTN_A && rm_bit_of(m, 0) == DM_BTN_B && rm_is_preset(m, 0) && !rm_is_preset(m, 1));
+        rm_assign(m, 0, 0);   // A takes the bottom face button, B (which had it) the right one
+        assert(m[0] == 0 && m[1] == 1 && m[2] == 3 && !rm_is_preset(m, 1) && !rm_is_preset(m, 0));
+        rm_assign(m, 6, 4);   // ZL takes L1, L takes L2
+        assert(rm_bit_of(m, 4) == DM_BTN_ZL && rm_bit_of(m, 6) == DM_BTN_L);
+        for (int k = 0; k < 200; k++) { rm_assign(m, (k * 7) % RM_N, (k * 11 + 3) % RM_N); int seen = 0; for (int i = 0; i < RM_N; i++) seen |= 1 << m[i]; assert(seen == 0xffff); }
+        rm_assign(m, -1, 3); rm_assign(m, 2, RM_N); int seen = 0; for (int i = 0; i < RM_N; i++) seen |= 1 << m[i]; assert(seen == 0xffff);
+    }
     // The saved phone layout must be evaluated against the phone's dimensions,
     // even if a 16:9 external screen is attached.
     float phone[4], external[4];
@@ -81,8 +91,10 @@ int main(void) {
     assert(ov_drag_pos(1100, 600, 1013, 50) == 506.5f);
     assert(ov_drag_pos(1100, 505, 1013, 50) == 508);
 
-    // the Gamepad tab's last row is the face buttons' (front_android.c pad_labels); the Game tab has no row there, and the controller's up and down skip it
-    assert(ov_menu_item(0, OVM_ROWS - 2) == OVM_PAD && ov_menu_item(1, OVM_ROWS - 2) < 0 && ov_menu_item(1, OVM_ROWS - 1) == OVM_RESUME);
+    // the Gamepad tab's last row is the face buttons' (front_android.c pad_labels); the Game tab's is Exit game (front_android.c menu_exit)
+    assert(ov_menu_item(0, OVM_ROWS - 2) == OVM_PAD && ov_menu_item(1, OVM_ROWS - 2) == OVM_EXIT && ov_menu_item(1, OVM_ROWS - 1) == OVM_RESUME);
+    // the Picture tab: Sharpen, then no rows (the controller's up and down skip them)
+    assert(OVM_TABS == 3 && ov_menu_item(2, 1) == OVM_SHARPEN && ov_menu_item(2, 2) == OVM_FPSCAP && ov_menu_item(2, 3) < 0 && ov_menu_item(2, OVM_ROWS - 1) == OVM_RESUME && ov_menu_item(3, 1) == ov_menu_item(0, 1));
     const float screens[][2] = {{915, 412}, {1216, 760}, {2400, 1080}, {1080, 2400}};
     for (unsigned s = 0; s < sizeof screens / sizeof screens[0]; s++) {
         float W = screens[s][0], H = screens[s][1], step = H / OVE_GRID_ROWS, p[4];

@@ -27,6 +27,13 @@ class DescriptorHash(unittest.TestCase):
 #include <string.h>
 static uint64_t g_set_epoch = 1, g_set_hits, g_set_new, g_ns_set_hash, g_ns_set_new;
 static int g_tracing, g_x_nosetc, updates, g_trace_frame;
+static int g_x_setwhy, st, g_x_nosetkeep;   // DM_VK_SET_WHY (off)
+static uint64_t free_gen; static uint32_t slot_rgen;   // kept sets: what the mocks of gfx_vk_core.c report
+int vk_cur_slot(void) { return 0; }
+uint32_t vk_slot_rgen(int slot) { (void)slot; return slot_rgen; }
+void vk_slot_hold(int slot) { (void)slot; }
+uint64_t vk_free_gen(void) { return free_gen; }
+static void set_why_note(int a, const VkWriteDescriptorSet *w, uint32_t n, VkDescriptorSetLayout l, int h, int e) { (void)a; (void)w; (void)n; (void)l; (void)h; (void)e; }
 static struct { VkDevice dev; } V;
 static uint64_t tick(void) { return 0; }
 static VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
@@ -73,10 +80,19 @@ static void padding_reuse(void) {
         for (unsigned i = 0; i < n; i++) image_padding(&images[i], 0xa5);
         assert(cached(VK_NULL_HANDLE, &w, 1) == first);
         assert(g_set_new == 1 && g_set_hits == 1 && updates == 1);
-        // Reuse is still limited to the submission epoch.
+        // Kept over submissions (set_kept): found again in the next submission while nothing was destroyed and its slot's pools stand
         g_set_epoch++;
-        assert(cached(VK_NULL_HANDLE, &w, 1) != first);
-        assert(g_set_new == 2 && updates == 2);
+        assert(cached(VK_NULL_HANDLE, &w, 1) == first && g_set_new == 1);
+        // an image, view or buffer destroyed since (an evicted texture's handle may name a new object): never found again
+        free_gen++; g_set_epoch++;
+        VkDescriptorSet second = cached(VK_NULL_HANDLE, &w, 1);
+        assert(second != first && g_set_new == 2 && updates == 2);
+        // its slot's pools reset since: never found again either
+        slot_rgen++; g_set_epoch++;
+        assert(cached(VK_NULL_HANDLE, &w, 1) != second && g_set_new == 3);
+        // DM_VK_X_SETKEEP unset (the default): per submission, as before
+        g_x_nosetkeep = 1; g_set_epoch++;
+        assert(g_set_new == 3 && cached(VK_NULL_HANDLE, &w, 1) && g_set_new == 4); g_x_nosetkeep = 0;
     }
 }
 static void field_changes(void) {

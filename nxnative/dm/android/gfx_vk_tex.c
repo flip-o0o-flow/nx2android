@@ -263,6 +263,7 @@ int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uin
 static int sparse_tex(const tex_t *t) { return t->pool && nvn_sparse_pool(t->pool); }
 uint64_t g_pkg_n, g_pkg_bytes, g_pkg_ns;   // packaged texture uploads: count, bytes, CPU time (the replay's per-frame line)
 static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
+extern uint64_t g_tex_frame;
 static uint64_t pkg_hash(const uint8_t *m, size_t n) {   // FNV-1a over 8-byte words
     uint64_t h = 1469598103934665603ull; size_t i = 0;
     for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, m + i, 8); h = (h ^ w) * 1099511628211ull; }
@@ -292,7 +293,13 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
             VKLOG("sparse upload: serial %llu %ux%ux%u format %#x levels %u flags %#x size %#llx mem %p pool %p tileH %u: %#llx bytes not mapped%s", (unsigned long long)t->serial, t->d.width, t->d.height,
                   t->d.depth, t->d.format, im->levels, t->d.flags, (unsigned long long)t->L.size, (const void *)t->mem, t->pool, t->L.tileH, (unsigned long long)miss, im->packaged > 1 ? " (again)" : ""); } }
     } else {
-        nvn_dirty_protect(t->mem, t->L.size);
+        // DM_VK_X_REPROT_HOLD=<presents> (start-up, off by default): a texture uploaded again within that many presents of its last upload (the game streaming into it:
+        // Batman: Arkham Knight's Batmobile drive, ~7,000 write faults a second on the RM) is left unprotected that long, then uploaded and protected again (vk_tex): its
+        // writes meanwhile take no fault each, and show at the end of the hold
+        static int hold = -1; if (hold < 0) { const char *e = getenv("DM_VK_X_REPROT_HOLD"); hold = e && atoi(e) > 0 ? atoi(e) : 0; }
+        if (hold && im->pkg_up_frame && g_tex_frame - im->pkg_up_frame < (uint64_t)hold) im->pkg_hold_until = g_tex_frame + (uint64_t)hold;
+        else { im->pkg_hold_until = 0; nvn_dirty_protect(t->mem, t->L.size); }
+        im->pkg_up_frame = g_tex_frame;
         im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
         im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0; im->pkg_hash = pkg_hash(t->mem, t->L.size);
     }
@@ -394,7 +401,8 @@ static vkimg_t *vk_tex_(const tex_t *t) {
         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
         else {
             uint64_t now = nvn_dirty_now();
-            if (im->pkg_sparse) { if (nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, im->pkg_vgen, im->pkg_stamp)) pkg_upload(im, t, f); }   // mapped or written since
+            if (im->pkg_hold_until) { if (g_tex_frame >= im->pkg_hold_until) pkg_upload(im, t, f); }   // DM_VK_X_REPROT_HOLD: unprotected until then; uploaded (and protected) again at its end
+            else if (im->pkg_sparse) { if (nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, im->pkg_vgen, im->pkg_stamp)) pkg_upload(im, t, f); }   // mapped or written since
             else if (now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) {   // pages written since the upload
                 // The GPU wrote the image since (a compute shader's image stores, a copy, a render) and its storage still holds the bytes of the upload: the writes were around
                 // it on shared pages, and an upload would put the CPU's bytes over the GPU's. Monster Hunter Rise's spot light profiles (512x1x64 R16F, written by a compute
@@ -434,7 +442,17 @@ void vk_tex_sweep(void) {
             v[nv++] = (pkg_age){im->pkg_used, im};
         }
     }
-    { int vk_pool_remap_ro(void *mem, size_t len); int nvn_dirty_defrag(int (*)(void *, size_t)); struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); int d = nvn_dirty_defrag(vk_pool_remap_ro); clock_gettime(CLOCK_MONOTONIC, &t1); static uint64_t nd;
+    // The process's mappings against the kernel's limit (vm.max_map_count): zero-copy pools are dma-buf mappings the kernel never merges again, so every protect boundary
+    // ever made in them stays a mapping. Each range is defragmented at DEFRAG_MP mprotect calls; with many pools none reaches it while the sum does: Batman: Arkham Knight's
+    // texture streaming (the Batmobile) reached the limit on the RM 489 s in, a write fault's mprotect failed and the game crashed. Past 60% of the limit every range with
+    // mprotect calls since its last defragmenting is mapped again in one piece
+    static int maxmaps; if (!maxmaps) { FILE *mf = fopen("/proc/sys/vm/max_map_count", "r"); if (!mf || fscanf(mf, "%d", &maxmaps) != 1 || maxmaps < 1000) maxmaps = 65530; if (mf) fclose(mf); }
+    int maps = 0; { FILE *mf = fopen("/proc/self/maps", "r"); char buf[1 << 16]; size_t n; if (mf) { while ((n = fread(buf, 1, sizeof buf, mf)) > 0) for (size_t i = 0; i < n; i++) maps += buf[i] == '\n'; fclose(mf); } }
+    { int vk_pool_remap_ro(void *mem, size_t len); int nvn_dirty_defrag(int (*)(void *, size_t)); int nvn_dirty_defrag_min(int (*)(void *, size_t), uint32_t); struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+      int high = maps > maxmaps * 6 / 10, d = high ? nvn_dirty_defrag_min(vk_pool_remap_ro, 1) : nvn_dirty_defrag(vk_pool_remap_ro);
+      if (high) { int after = 0; FILE *mf = fopen("/proc/self/maps", "r"); char buf[1 << 16]; size_t n; if (mf) { while ((n = fread(buf, 1, sizeof buf, mf)) > 0) for (size_t i = 0; i < n; i++) after += buf[i] == '\n'; fclose(mf); }
+          int mid, quiet, fail; void nvn_dirty_defrag_why(int *, int *, int *); nvn_dirty_defrag_why(&mid, &quiet, &fail);
+          static int nh; if (nh++ < 50) VKLOG("dirty-page tracking: %d mappings of the kernel's %d: %d pool(s) mapped again in one piece (left: %d starting mid-page, %d written by the host just before, %d refused), %d mappings now", maps, maxmaps, d, mid, quiet, fail, after); maps = after; } clock_gettime(CLOCK_MONOTONIC, &t1); static uint64_t nd;
         if (d && (nd += d) <= 8) VKLOG("dirty-page tracking: %d pool(s) mapped again in one piece in %.1f ms (%llu so far)", d, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, (unsigned long long)nd); }
     int runs = nvn_dirty_runs();
     if (runs > PKG_RUNS && nv) {   // the least recently drawn first, in batches, until the runs are well under the budget
@@ -447,7 +465,9 @@ void vk_tex_sweep(void) {
     pthread_mutex_unlock(&g_img_mu);
     free(v);
     static uint64_t total; total += idle + lru;
-    if (g_tex_frame % 3000 == 0) VKLOG("images: %llu live, %.0f MB of textures, %llu evicted so far (a newer texture over their memory)", (unsigned long long)g_img_n, g_img_bytes / 1048576.0, (unsigned long long)g_img_evicted);
+    if (g_tex_frame % 900 == 0) { uint64_t nvn_dirty_rescues(void);   // (every 30 s at 30 fps: the mappings against the limit)
+        VKLOG("images: %llu live, %.0f MB of textures, %llu evicted so far (a newer texture over their memory); %d mappings of %d, %d protected runs, %llu mprotect rescues", (unsigned long long)g_img_n, g_img_bytes / 1048576.0, (unsigned long long)g_img_evicted,
+              maps, maxmaps, nvn_dirty_runs(), (unsigned long long)nvn_dirty_rescues()); }
     if ((idle || lru) && (g_tex_frame % 3000 == 0 || lru)) VKLOG("packaged textures: %llu not drawn for %d presents and %llu least recently drawn released their write protection (%llu pages; %llu so far); %d protected runs",
                     (unsigned long long)idle, PKG_IDLE, (unsigned long long)lru, (unsigned long long)(nvn_dirty_released() - before), (unsigned long long)total, runs);
 }
@@ -735,7 +755,12 @@ static VkSampler make_sampler(const samp_par *p) {
     ci.mipmapMode = p->minf == 4 || p->minf == 5 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     ci.addressModeU = wrap(p->ws); ci.addressModeV = wrap(p->wt); ci.addressModeW = wrap(p->wr);
     ci.mipLodBias = p->lod_bias;
-    ci.anisotropyEnable = p->aniso > 1.0f; ci.maxAnisotropy = p->aniso > V.max_aniso ? V.max_aniso : p->aniso;
+    // DM_VK_ANISO=<2..16> (start-up; a quality choice, off by default): at least that much anisotropic filtering for samplers that filter linearly with mipmaps, as a PC
+    // driver's override does; not for nearest filtering, depth-compare (shadow) samplers or samplers held to level 0 (lod_max 0). Batman: Arkham Knight's roads and floors
+    float aniso = p->aniso;
+    { static float force = -1; if (force < 0) { const char *e = getenv("DM_VK_ANISO"); force = e && atoi(e) >= 2 ? (float)(atoi(e) > 16 ? 16 : atoi(e)) : 0; }
+      if (force > aniso && p->magf && (p->minf == 5 || p->minf == 3) && !p->cmp_mode && p->lod_max > 0) aniso = force; }
+    ci.anisotropyEnable = aniso > 1.0f && V.max_aniso > 1.0f; ci.maxAnisotropy = aniso > V.max_aniso ? V.max_aniso : aniso;
     ci.compareEnable = p->cmp_mode == 1; ci.compareOp = cmp_op(p->cmp_func);
     ci.minLod = p->lod_min; ci.maxLod = p->minf <= 1 ? 0.25f : p->lod_max;   // no mipmap filter: level 0 only (GL's rule)
     // ... and from level 0: Metal's NotMipmapped (nvn_mtl.m samp_by_id) reads level 0 whatever the LOD clamp; a minimum LOD above 0.25 with maxLod 0.25 is invalid in Vulkan

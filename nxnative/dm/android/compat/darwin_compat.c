@@ -135,6 +135,12 @@ kern_return_t task_info(task_t task, task_flavor_t flavor, task_info_t out, mach
     if (!ok) return KERN_FAILURE;
     uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE);
     vi->virtual_size = vsz * pg; vi->resident_size = vi->phys_footprint = vi->internal = rss * pg; vi->page_size = (integer_t)pg;
+    // The footprint as the Mac counts it: the process's own memory (anonymous and shared, and what of it went to swap), not the clean file pages it has mapped, which the
+    // kernel drops when it needs the memory. The resident size counts those too: Batman: Arkham Knight showed 8.4-9.0 GB on the Red Magic (its game files, mapped) against
+    // 0.7-1.2 GB on the OnePlus 10 Pro with less memory free
+    if ((f = fopen("/proc/self/status", "re"))) { char l[128]; unsigned long long kb, own = 0; int n = 0;
+        while (fgets(l, sizeof l, f)) if ((sscanf(l, "RssAnon: %llu", &kb) == 1 || sscanf(l, "RssShmem: %llu", &kb) == 1 || sscanf(l, "VmSwap: %llu", &kb) == 1) && ++n) own += kb;
+        fclose(f); if (n) vi->phys_footprint = vi->internal = own * 1024; }
     return KERN_SUCCESS;
 }
 kern_return_t task_threads(task_t task, thread_act_array_t *list, mach_msg_type_number_t *count) {

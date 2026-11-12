@@ -92,6 +92,7 @@ void dm_guest_write_prepare(void *a, size_t n) { if (write_hook) write_hook(a, n
 static int fail_unprotect;
 static int checked_mprotect(void *a, size_t n, int prot) {
     if (fail_unprotect && prot == (PROT_READ | PROT_WRITE)) {
+        if (fail_unprotect == -1) { errno = ENOMEM; return -1; }   // every writable call fails: the rescue (the whole range) fails too
         if (fail_unprotect == 3) { fail_unprotect = 1; return mprotect(a, n, prot); }
         if (fail_unprotect == 2) assert(mprotect(a, (size_t)getpagesize(), prot) == 0);
         fail_unprotect = 0; errno = ENOMEM; return -1;
@@ -443,7 +444,9 @@ int main(int argc, char **argv) {
             for case in ('13', '14'):
                 result = subprocess.run([str(exe), case], capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 88, result.stderr)
-            for failure in ('1', '2', '3'):  # total/partial failure before copying, and failure in the signal handler
+            for failure in ('1', '2', '3'):  # total/partial failure before copying, and failure in the signal handler: the whole range is made writable instead (nvn_dirty.c range_writable)
                 result = subprocess.run([str(exe), failure], capture_output=True, text=True, timeout=15)
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn('cannot make guest memory writable; stopping', result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            result = subprocess.run([str(exe), '-1'], capture_output=True, text=True, timeout=15)   # the rescue fails as well: the process stops
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('cannot make guest memory writable; stopping', result.stderr)

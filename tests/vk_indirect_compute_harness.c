@@ -25,7 +25,14 @@ static int g_x_nosetmemo, g_tracing, g_var_now, g_x_nosetc, g_x_nodrvc, g_x_setv
 #define TFLOG(...) ((void)0)
 static void tf_words(const char *what, const uint32_t *w, uint32_t nw) { (void)what; (void)w; (void)nw; }
 static void istat_flush(void) {}
+static int g_x_setwhy, g_x_nosetkeep; static uint64_t g_x_peek, g_vk_free_gen;
+int vk_cur_slot(void) { return 0; }
+uint32_t vk_slot_rgen(int slot) { (void)slot; return 0; }
+void vk_slot_hold(int slot) { (void)slot; }
+uint64_t vk_free_gen(void) { return 0; }
+static void set_why_note(int st, const VkWriteDescriptorSet *w, uint32_t nw, VkDescriptorSetLayout dsl, int hit, int same) { (void)st; (void)w; (void)nw; (void)dsl; (void)hit; (void)same; }
 static int g_x_tracepass = -1, g_sub_pass, g_prof_on, g_prereset = 1;
+static uint64_t g_slot_wait_ns;   // slot_recycle: its waits for the GPU (the long-frame line)
 static uint64_t g_prof_ns[8], g_fence;
 static long long g_td_off = -1;
 static struct { uint64_t dispatches; } g_vkst;
@@ -40,6 +47,7 @@ static int crumbs_on(void) { return 0; }
 static crumb_t *crumb_cur(void) { abort(); }
 static void crumb_mark(int n) { abort(); }
 void vk_pass_ts(int a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {}
+void vk_pass_ts_key(uint64_t k) { (void)k; }
 int vk_readback_ranges(void) { return 0; }
 void vk_readback_unknown(void) { abort(); }
 void vk_gpu_wrote(uint64_t a, uint64_t n) {}
