@@ -198,10 +198,8 @@ public class ExternalActivity extends NativeActivity implements ExternalDisplay.
             rasterState = state; rasterWidth = W; rasterHeight = H; return menuRaster;
         }
         private void drawMenu(Canvas c, float[] data) {
-            Bitmap bitmap = menuRaster(menuState); if (bitmap == null) return;
-            float W = getWidth(), H = getHeight(), scale = Math.min(data[1], .92f / (6 * .115f + 2 * .03f));
-            float w = Math.min(.95f * H * scale, W * .96f), h = (6 * .115f + 2 * .03f) * H * scale;
-            paint.setAlpha(255); c.drawBitmap(bitmap, null, new RectF((W-w)/2, (H-h)/2, (W+w)/2, (H+h)/2), paint);
+            Bitmap bitmap = menuRaster(menuState); if (bitmap == null) return;   // the shell: the view's size, drawn 1:1 over it (gfx_vk_present.c ov_shell)
+            paint.setAlpha(255); c.drawColor(Color.argb(115, 0, 0, 0)); c.drawBitmap(bitmap, 0, 0, paint);
         }
         private void drawEditor(Canvas c, float[] data, int state) {
             Bitmap bitmap = menuRaster(state); if (bitmap == null) return;
@@ -213,19 +211,10 @@ public class ExternalActivity extends NativeActivity implements ExternalDisplay.
             int selected=((state >> 8) & 255)-1;
             for(int i=0;i<names.length;i++) {
                 int b=4+i*9; float t=Math.max(2,H*.003f)*(i==selected?2:1);
-                paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(t); paint.setColor(i==selected ? Color.rgb(255,60,142) : Color.argb(89,255,255,255));
+                paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(t); paint.setColor(i==selected ? Color.rgb(43,224,107) : Color.argb(89,255,255,255));
                 c.drawRect(data[b+1]-data[b+3]-t/2,data[b+2]-data[b+4]-t/2,data[b+1]+data[b+3]+t/2,data[b+2]+data[b+4]+t/2,paint);
             }
-            paint.setStyle(Paint.Style.FILL); paint.setAlpha(255); paint.setColor(Color.WHITE);
-            float w=Math.min(.85f*H*scale,W*.96f), h=.30f*H*scale, x=(W-w)/2, y=.13f*H;
-            int tw=Math.min((int)(w/2),bitmap.getWidth()), th=Math.min((int)(h/2),bitmap.getHeight());
-            if(tw>0 && th>0) c.drawBitmap(bitmap,new Rect(0,0,tw,th),new RectF(x,y,x+w,y+h),paint);
-            if ((state & 1) != 0) {
-                c.drawColor(Color.argb(115,0,0,0));
-                float pw=Math.min(.75f*H*scale,W*.9f), ph=.30f*H*scale, px=(W-pw)/2, py=(H-ph)/2;
-                int sx=Math.min((int)(pw/2),bitmap.getWidth()), sy=th+2, sh=Math.min((int)(ph/2),bitmap.getHeight()-sy);
-                if(sx>0 && sh>0)c.drawBitmap(bitmap,new Rect(0,sy,sx,sy+sh),new RectF(px,py,px+pw,py+ph),paint);
-            }
+            paint.setStyle(Paint.Style.FILL); paint.setAlpha(255); c.drawBitmap(bitmap, 0, 0, paint);   // the toolbar and the prompt (with its darker frame), 1:1
         }
         @Override public boolean onTouchEvent(MotionEvent event) {
             int action=event.getActionMasked();

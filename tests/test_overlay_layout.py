@@ -102,6 +102,18 @@ int main(void) {
         for (int row = 0; row < OVM_ROWS; row++) {
             float r[4]; ov_menu_rowrect(p, row, r);
             assert(ov_menu_row_at(r[0] + r[2] / 2, r[1] + r[3] / 2, W, H) == row);
+            if (row > 0) assert(r[0] > ov_m_edge(W, H, 0));   // the cards and Resume clear of the panel
+        }
+        for (int t = 0; t < OVM_TABS; t++) {   // the tabs' list: a finger on a tab opens that one
+            float r[4]; ov_m_tab(W, H, t, r);
+            assert(ov_menu_tab_at(r[0] + r[2] / 2, r[1] + r[3] / 2, p) == t && ov_menu_row_at(r[0] + r[2] / 2, r[1] + r[3] / 2, W, H) == 0);
+        }
+        {   // between two cards is the menu's (no tap on the game); between the panel and the cards is the game's; the slider's track in its card, its right end the most
+            float a[4], b[4], t[3], u = ov_m_unit(W, H); ov_m_card(W, H, 1, a); ov_m_card(W, H, 2, b);
+            assert(ov_menu_row_at(a[0] + a[2] / 2, (a[1] + a[3] + b[1]) / 2, W, H) == -1);
+            float gx = (ov_m_edge(W, H, H / 2) + a[0] - 0.03f * u) / 2; assert(ov_menu_row_at(gx, H / 2, W, H) == -2);
+            ov_menu_track(p, 2, t); ov_menu_rowrect(p, 2, a);
+            assert(t[0] > a[0] && t[0] + t[2] < a[0] + a[2] && ov_menu_track_value(t[0] + t[2], p, 2) == OV_OPACITY_MAX && ov_menu_track_value(t[0], p, 2) == OV_OPACITY_MIN);
         }
         for (int axis = 0; axis < 2; axis++) for (int i = -10; i <= 110; i++) {
             float extent = screens[s][axis], half = H * 0.12f;

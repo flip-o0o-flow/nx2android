@@ -584,7 +584,7 @@ static void menu_touch(AInputEvent *e, float W, float H) {   // a press on a row
     if (act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_POINTER_DOWN) {
         if (g_menu_ptr >= 0) return;
         g_menu_ptr = id; g_menu_row = row;
-        if (item == OVM_TAB) menu_tab(ov_menu_tab_at(x, p));   // a tab opens as the finger touches it
+        if (item == OVM_TAB) menu_tab(ov_menu_tab_at(x, y, p));   // a tab opens as the finger touches it
         else if (item == OVM_OPACITY) menu_opacity(ov_menu_track_value(x, p, row));
         if (row >= 0) { atomic_store(&g_menu_hi, item >= 0 ? row : -1); dm_overlay_redraw(); }
     } else if (act == AMOTION_EVENT_ACTION_MOVE && g_menu_ptr >= 0 && g_menu_row >= 0) {   // the slider follows the finger; another row's highlight follows it off the row and back
@@ -743,6 +743,20 @@ static void sp_size(char *out, int cap, const dm_save_entry *s) {
     else snprintf(out, (size_t)cap, "%ld file%s, %lld KB", s->files, s->files == 1 ? "" : "s", (s->bytes + 1023) / 1024);
 }
 #define SP_ROW(i, st, ...) do { rows[i].style = st; snprintf(rows[i].left, sizeof rows[i].left, __VA_ARGS__); } while (0)
+// the game's name for the shell's header (gfx_vk_present.c ov_m_panel): nx2a-data.json's "name" (porter/datapack.py), read once; "" without it
+const char *dm_game_name(void) {
+    static char name[96]; static int done; if (done) return name;
+    done = 1; char p[600], b[4096]; snprintf(p, sizeof p, "%s/nx2a-data.json", g_root); FILE *f = fopen(p, "r"); if (!f) return name;
+    size_t n = fread(b, 1, sizeof b - 1, f); fclose(f); b[n] = 0;
+    const char *k = strstr(b, "\"name\""); if (k) k = strchr(k + 6, ':'); if (k) k = strchr(k, '"');
+    if (k) { size_t o = 0; for (k++; *k && *k != '"' && o + 4 < sizeof name; k++) {
+        unsigned c = 0; if (*k == '\\' && k[1] == 'u' && sscanf(k + 2, "%4x", &c) == 1) k += 5;   // \uXXXX (json.dumps writes non-ASCII so), as UTF-8
+        else { if (*k == '\\' && k[1]) k++; name[o++] = *k; continue; }   // (raw UTF-8 bytes as they are)
+        if (c < 0x80) name[o++] = (char)c; else if (c < 0x800) { name[o++] = (char)(0xc0 | c >> 6); name[o++] = (char)(0x80 | (c & 63)); }
+        else { name[o++] = (char)(0xe0 | c >> 12); name[o++] = (char)(0x80 | (c >> 6 & 63)); name[o++] = (char)(0x80 | (c & 63)); } }
+        name[o] = 0; }
+    return name;
+}
 int dm_save_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_save_panel)
     if (!atomic_load(&g_sp_on)) return 0;
     memset(rows, 0, sizeof(ov_srow) * OVM_ROWS);
@@ -935,7 +949,7 @@ static int tx_key(AInputEvent *e) {   // every key goes to the entry while it is
 static void tx_touch(AInputEvent *e, float W, float H) {   // a key is pressed when the finger that went down on it lifts there
     int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK, ai = AMotionEvent_getAction(e) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
     int i = act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_UP ? 0 : ai;
-    float p[4]; ov_menu_rect(W, H, p);
+    float p[4]; ov_kb_rect(W, H, p);
     int key = ov_kb_at(AMotionEvent_getX(e, (size_t)i), AMotionEvent_getY(e, (size_t)i), p);
     if (act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_POINTER_DOWN) {
         pthread_mutex_lock(&g_tx_mu); g_tx.ptr = key; if (key >= 0) g_tx.sel = key; pthread_mutex_unlock(&g_tx_mu);

@@ -17,9 +17,10 @@ PY = sys.executable
 UI_FONT = DM / 'third_party/fusion-pixel-font/fusion-pixel-12px-proportional-zh_tw.nxpf'
 
 
-def ui_font_assets():   # {name under assets/: file}: the overlay's font and its license files (Port.ui_font; porter host puts them in an APK ported before them)
-    d = UI_FONT.parent
-    return {'font/ui.bin': UI_FONT, **{f'font/{f.relative_to(d).as_posix()}': f for f in sorted(p for p in d.rglob('*.txt'))}}
+def ui_font_assets():   # {name under assets/: file}: the overlay's fonts and their license files (Port.ui_font; porter host puts them in an APK ported before them)
+    d = UI_FONT.parent; r = UI_FONT.parents[1] / 'roboto'   # the pixel font, and the shell's smooth font (dm/android/tools/ui_atlas.py bakes it)
+    return {'font/ui.bin': UI_FONT, **{f'font/{f.relative_to(d).as_posix()}': f for f in sorted(p for p in d.rglob('*.txt'))},
+            'font/ui_smooth.bin': r / 'ui_smooth.nxsf', 'font/LICENSES/roboto/OFL.txt': r / 'OFL.txt'}
 # The letters of the button-icon font (make_ext_font.py knocks them out of the icons): a bold system font of the machine that ports, never shipped in the repository
 LETTER_FONTS = [f'{os.environ.get("WINDIR", "C:/Windows")}/Fonts/{f}' for f in ('ARLRDBD.TTF', 'arialbd.ttf')] + [
     '/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf']

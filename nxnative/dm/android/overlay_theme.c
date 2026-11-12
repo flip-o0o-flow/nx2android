@@ -31,6 +31,12 @@ const uint8_t *dm_overlay_font(void) {
     return f;
 }
 
+// The shell's smooth font (gfx_vk_present.c cv_s, tools/ui_atlas.py): read once, kept for good; NULL without it (the shell then draws the pixel font)
+const uint8_t *dm_overlay_sfont(size_t *n) {
+    static int tried; static uint8_t *f; static size_t len; if (!tried) { tried = 1; f = asset("font/ui_smooth.bin", &len); if (!f) LOG("[RED] the APK has no smooth font (assets/font/ui_smooth.bin): the shell draws the pixel font"); }
+    *n = len; return f;
+}
+
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 static uint8_t *png_rgba(const uint8_t *f, size_t n, int *pw, int *ph) {   // RGBA texels (malloc), NULL for a PNG of another kind
     if (n < 8 || memcmp(f, "\x89PNG\r\n\x1a\n", 8)) return NULL;
