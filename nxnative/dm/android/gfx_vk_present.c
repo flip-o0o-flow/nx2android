@@ -14,6 +14,7 @@
 #include "overlay_frag.spv.h"
 #include "sharpen_vert.spv.h"
 #include "sharpen_frag.spv.h"
+#include "upscale_frag.spv.h"
 #include "rot_vert.spv.h"
 #include "rot_frag.spv.h"
 
@@ -1049,9 +1050,16 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
 // ---- Sharpening at present (DM_VK_SHARPEN=<0..100>, also the pause menu's Sharpen row, which sets it; 0 = off, the blit as before). The game's window image (Batman: Arkham
 // Knight's 1920x1080, already scaled up by the game from its 960x540 scene) is drawn into the picture's rectangle by a contrast-adaptive sharpening shader (shaders/sharpen.*)
 // in place of vkCmdBlitImage's linear filter; the overlay and the menu are drawn after it, unsharpened. Read again every 30 presents ----
-static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkSampler samp; VkPipeline pipe; VkFormat pfmt; VkImage img[4]; VkImageView view[4]; VkDescriptorSet set[4]; int next; } g_sh;
+static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkSampler samp; VkPipeline pipe, upipe; VkFormat pfmt, upfmt; VkImage img[4]; VkImageView view[4]; VkDescriptorSet set[4]; int next; } g_sh;
 static int sharpen_level(void) { static int v, n; if (n++ % 30 == 0) { const char *e = getenv("DM_VK_SHARPEN"); v = e ? atoi(e) : 0; v = v < 0 ? 0 : v > 100 ? 100 : v; } return v; }
-static int sharpen_ready(void) {
+// DM_VK_UPSCALE=gsr (live, read again every 30 presents): the picture is drawn by Snapdragon GSR 1 (shaders/upscale.frag: edge-directed, sharpening built in) in place of the
+// linear blit or the sharpening; DM_VK_UPSCALE_SHARP=<sharpness>, GSR's EdgeSharpness (2.0 by default, upstream's). Unset or 0: as before
+static float upscale_sharp(void) {
+    static float v; static int n; if (n++ % 30 == 0) { const char *e = getenv("DM_VK_UPSCALE"), *k = getenv("DM_VK_UPSCALE_SHARP");
+        int on = e && (!strcmp(e, "gsr") || atoi(e) > 0); v = k ? (float)atof(k) : 2.0f; v = !on ? 0 : v < 0.001f ? 0.001f : v > 4 ? 4 : v; }   // (on: above 0)
+    return v;
+}
+static int sharpen_ready(int up) {
     if (!g_sh.dsl) {
         VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b}; VKCHK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_sh.dsl));
@@ -1064,12 +1072,14 @@ static int sharpen_ready(void) {
             VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
         VKCHK(vkCreateSampler(V.dev, &si, NULL, &g_sh.samp));
     }
-    if (g_sh.pfmt == g_sfmt && g_sh.pipe) return 1;
-    if (g_sh.pipe) { vkDestroyPipeline(V.dev, g_sh.pipe, NULL); g_sh.pipe = VK_NULL_HANDLE; }
+    VkPipeline *pp = up ? &g_sh.upipe : &g_sh.pipe; VkFormat *pf = up ? &g_sh.upfmt : &g_sh.pfmt;
+    if (*pf == g_sfmt && *pp) return 1;
+    if (*pp) { vkDestroyPipeline(V.dev, *pp, NULL); *pp = VK_NULL_HANDLE; }
     VkRenderPass orp = V.has_dynrender ? VK_NULL_HANDLE : ov_rp(); if (!V.has_dynrender && !orp) return 0;
     VkShaderModule vm, fm;
     VkShaderModuleCreateInfo vc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof sharpen_vert_spv, sharpen_vert_spv}; VKCHK(vkCreateShaderModule(V.dev, &vc, NULL, &vm));
-    VkShaderModuleCreateInfo fc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof sharpen_frag_spv, sharpen_frag_spv}; VKCHK(vkCreateShaderModule(V.dev, &fc, NULL, &fm));
+    VkShaderModuleCreateInfo fc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, up ? sizeof upscale_frag_spv : sizeof sharpen_frag_spv, up ? upscale_frag_spv : sharpen_frag_spv};
+    VKCHK(vkCreateShaderModule(V.dev, &fc, NULL, &fm));
     VkPipelineShaderStageCreateInfo ss[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vm, "main", NULL},
                                             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fm, "main", NULL}};
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -1082,10 +1092,11 @@ static int sharpen_ready(void) {
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR}; VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
     VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &g_sfmt};
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, orp ? NULL : &rci, 0, 2, ss, &vi, &ia, NULL, &vs, &rs, &ms, NULL, &cbs, &dy, g_sh.layout, orp};
-    VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &g_sh.pipe);
+    VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, pp);
     vkDestroyShaderModule(V.dev, vm, NULL); vkDestroyShaderModule(V.dev, fm, NULL);
-    if (r) { g_sh.pipe = VK_NULL_HANDLE; VKRED_ONCE(115, "sharpening pipeline failed: %d (the picture is blitted unsharpened)", r); return 0; }
-    g_sh.pfmt = g_sfmt; VKLOG("present: contrast-adaptive sharpening on (DM_VK_SHARPEN %d)", sharpen_level());
+    if (r) { *pp = VK_NULL_HANDLE; VKRED_ONCE(115, "%s pipeline failed: %d (the picture is blitted as before)", up ? "upscale" : "sharpening", r); return 0; }
+    *pf = g_sfmt;
+    if (up) VKLOG("present: Snapdragon GSR 1 upscale on (DM_VK_UPSCALE, sharpness %.2f)", upscale_sharp()); else VKLOG("present: contrast-adaptive sharpening on (DM_VK_SHARPEN %d)", sharpen_level());
     return 1;
 }
 static VkDescriptorSet sharpen_set(vkimg_t *im) {   // the window image's view and set (the game's window images: a few, kept)
@@ -1102,19 +1113,19 @@ static VkDescriptorSet sharpen_set(vkimg_t *im) {   // the window image's view a
 }
 // draws the picture sharpened into tgt (TRANSFER_DST after its clear) → 1 (tgt is then COLOR_ATTACHMENT_OPTIMAL), or 0: blit it as before
 static int sharpen_draw(VkCommandBuffer cb, vkimg_t *im, VkImage tgt, VkImageView tview, uint32_t idx, int cx, int cy, int cw, int ch, int dx, int dy, int dw, int dh) {
-    int lvl = sharpen_level(); if (!lvl || im->samples > 1 || im->layers > 1) return 0;
-    if (!sharpen_ready()) return 0;
+    int lvl = sharpen_level(); float up = upscale_sharp(); if ((!lvl && !up) || im->samples > 1 || im->layers > 1) return 0;
+    if (!sharpen_ready(up > 0)) return 0;
     VkFramebuffer fb = V.has_dynrender ? VK_NULL_HANDLE : ov_fb(idx); if (!V.has_dynrender && !fb) return 0;
     VkDescriptorSet set = sharpen_set(im); if (!set) return 0;
     barrier(cb, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     if (V.has_dynrender) { VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, tview, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE};
         VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, g_sext}, 1, 0, 1, &ca, NULL, NULL}; vkCmdBeginRendering(cb, &ri); }
     else { VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, g_ov.rp, fb, {{0, 0}, g_sext}, 0, NULL}; vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE); }
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sh.pipe);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, up > 0 ? g_sh.upipe : g_sh.pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sh.layout, 0, 1, &set, 0, NULL);
     VkViewport vp = {(float)dx, (float)dy, (float)dw, (float)dh, 0, 1}; VkRect2D sc = {{dx < 0 ? 0 : dx, dy < 0 ? 0 : dy}, {(uint32_t)dw, (uint32_t)dh}};
     vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
-    struct { float src[4], sharp, flip; } pc = {{(float)cx / im->w, (float)cy / im->h, (float)cw / im->w, (float)ch / im->h}, lvl / 100.0f, vk_window_bottom_up() ? 1.0f : 0.0f};
+    struct { float src[4], sharp, flip; } pc = {{(float)cx / im->w, (float)cy / im->h, (float)cw / im->w, (float)ch / im->h}, up > 0 ? up : lvl / 100.0f, vk_window_bottom_up() ? 1.0f : 0.0f};
     vkCmdPushConstants(cb, g_sh.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
     vkCmdDraw(cb, 3, 1, 0, 0);
     if (V.has_dynrender) vkCmdEndRendering(cb); else vkCmdEndRenderPass(cb);

@@ -761,6 +761,10 @@ static VkSampler make_sampler(const samp_par *p) {
     { static float force = -1; if (force < 0) { const char *e = getenv("DM_VK_ANISO"); force = e && atoi(e) >= 2 ? (float)(atoi(e) > 16 ? 16 : atoi(e)) : 0; }
       if (force > aniso && p->magf && (p->minf == 5 || p->minf == 3) && !p->cmp_mode && p->lod_max > 0) aniso = force; }
     ci.anisotropyEnable = aniso > 1.0f && V.max_aniso > 1.0f; ci.maxAnisotropy = aniso > V.max_aniso ? V.max_aniso : aniso;
+    // DM_VK_LOD_BIAS=<-2..0> (start-up; off by default): added to the same samplers' LOD bias, as upscalers do (log2 of the render over the output size): textures
+    // keep their detail when the scene is drawn at a lower resolution than shown; too far negative shimmers
+    { static float bias = 1; if (bias > 0) { const char *e = getenv("DM_VK_LOD_BIAS"); bias = e ? (float)atof(e) : 0; bias = bias > 0 ? 0 : bias < -2 ? -2 : bias; }
+      if (bias < 0 && p->magf && (p->minf == 5 || p->minf == 3) && !p->cmp_mode && p->lod_max > 0) ci.mipLodBias += bias; }
     ci.compareEnable = p->cmp_mode == 1; ci.compareOp = cmp_op(p->cmp_func);
     ci.minLod = p->lod_min; ci.maxLod = p->minf <= 1 ? 0.25f : p->lod_max;   // no mipmap filter: level 0 only (GL's rule)
     // ... and from level 0: Metal's NotMipmapped (nvn_mtl.m samp_by_id) reads level 0 whatever the LOD clamp; a minimum LOD above 0.25 with maxLod 0.25 is invalid in Vulkan
